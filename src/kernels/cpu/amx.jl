@@ -19,7 +19,7 @@ function triangle_attention_amx!(
     k::AbstractArray{T, 5}, 
     v::AbstractArray{T, 5}, 
     bias::AbstractArray{T, 4}, 
-    mask::Union{Nothing, AbstractArray{T, 3}}; 
+    mask::Union{Nothing, AbstractArray{T, 3}, AbstractArray{Bool, 3}}; 
     kwargs...
 ) where T
     D, H, N, _, B = size(q)

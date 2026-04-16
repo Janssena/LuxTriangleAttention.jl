@@ -41,6 +41,6 @@ end
 # TODO: Should we be using AbstractArray{Bool} for masks?
 function _apply_mask!(scores::AbstractArray{T, 2}, mask::AbstractArray{Bool, 3}, idxs::Tuple; neg_inf=-_safe_inf(T)) where T
     mask_slice = transpose(view(mask, idxs...))
-    @. scores = ifelse(mask_slice, neg_inf, scores)
+    @. scores = ifelse(mask_slice, scores, neg_inf)
     return nothing
 end
