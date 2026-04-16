@@ -1,5 +1,5 @@
 """
-    triangle_attention_tullio!(out, q, k, v, bias, mask=nothing)
+    triangle_attention_tullio!(out, q, k, v, bias, mask)
 
 Computes multi-head triangle attention for pair representations. 
 Uses @tullio and @inbounds to generatie fast and efficient loops.
@@ -17,7 +17,8 @@ function triangle_attention_tullio!(
     k::AbstractArray{T, 5}, 
     v::AbstractArray{T, 5}, 
     bias::AbstractArray{T, 4}, 
-    mask::Union{Nothing, AbstractArray{T, 3}}
+    mask::Union{Nothing, AbstractArray{T, 3}}; 
+    kwargs...
 ) where T
     D, H, N, _, B = size(q)
     scale = T(1.0 / sqrt(D))
@@ -28,7 +29,7 @@ function triangle_attention_tullio!(
         max_workspace = Matrix{T}(undef, N, 1)
         sum_workspace = Matrix{T}(undef, N, 1)
         
-        @inbounds for h in 1:H
+        Threads.@threads for h in 1:H
             for i in 1:N
                 q_i = @view q[:, h, i, :, b] 
                 k_i = @view k[:, h, i, :, b]
@@ -38,8 +39,8 @@ function triangle_attention_tullio!(
                 
                 _tullio_qk!(scores, q_i, k_i, scale)
                 @. scores += bias_slice
-                
-                _apply_mask!(scores, mask, (i, :, b))
+
+                _apply_mask!(scores, mask, (i, :, b); kwargs...)
 
                 maximum!(max_workspace, scores)
                 @. exp_scores = exp(scores - max_workspace)

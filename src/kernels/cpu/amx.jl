@@ -1,10 +1,10 @@
 import LinearAlgebra: mul!, transpose
 
 """
-    triangle_attention_amx!(out, q, k, v, bias, mask=nothing)
+    triangle_attention_amx!(out, q, k, v, bias, mask)
 
 Computes multi-head triangle attention for pair representations. 
-Uses mul! to leverage the faster Accelerate framework on Apple silicon
+Uses mul! to leverage the faster Accelerate backend on Apple silicon.
 
 # Shapes
 - `q`, `k`, `v`: `[D, H, N, N, B]`
@@ -19,7 +19,8 @@ function triangle_attention_amx!(
     k::AbstractArray{T, 5}, 
     v::AbstractArray{T, 5}, 
     bias::AbstractArray{T, 4}, 
-    mask::Union{Nothing, AbstractArray{T, 3}}
+    mask::Union{Nothing, AbstractArray{T, 3}}; 
+    kwargs...
 ) where T
     D, H, N, _, B = size(q)
     scale = T(1.0 / sqrt(D))
@@ -30,7 +31,7 @@ function triangle_attention_amx!(
         max_workspace = Matrix{T}(undef, N, 1)
         sum_workspace = Matrix{T}(undef, N, 1)
         
-        Threads.@threads for h in 1:H
+        for h in 1:H
             for i in 1:N
                 q_i = @view q[:, h, i, :, b] 
                 k_i = @view k[:, h, i, :, b]
@@ -41,7 +42,7 @@ function triangle_attention_amx!(
                 mul!(scores, transpose(q_i), k_i)
                 @. scores = (scores * scale) + bias_slice
                 
-                _apply_mask!(scores, mask, (i, :, b))
+                _apply_mask!(scores, mask, (i, :, b); kwargs...)
 
                 maximum!(max_workspace, scores)
                 @. exp_scores = exp(scores - max_workspace)

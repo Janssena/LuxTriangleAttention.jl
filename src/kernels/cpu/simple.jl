@@ -1,5 +1,5 @@
 """
-    triangle_attention_simple!(out, q, k, v, bias, mask=nothing)
+    triangle_attention_simple!(out, q, k, v, bias, mask)
 
 Computes multi-head triangle attention for pair representations. 
 Should only be used for benchmarking purposes.
@@ -16,7 +16,8 @@ function triangle_attention_simple!(
     k::AbstractArray{T, 5}, 
     v::AbstractArray{T, 5}, 
     bias::AbstractArray{T, 4}, 
-    mask::Union{Nothing, AbstractArray{T, 3}}
+    mask::Union{Nothing, AbstractArray{T, 3}}; 
+    kwargs...
 ) where T
     D, H, N, _, B = size(q)
     scale = T(1.0 / sqrt(D))
@@ -34,7 +35,7 @@ function triangle_attention_simple!(
                 bias_slice = @view bias[h, :, :, b]
                 scores .+= bias_slice
                 
-                _apply_mask!(scores, mask, (i, :, b))
+                _apply_mask!(scores, mask, (i, :, b); kwargs...)
 
                 max_scores = maximum(scores, dims=2)
                 exp_scores = exp.(scores .- max_scores)
