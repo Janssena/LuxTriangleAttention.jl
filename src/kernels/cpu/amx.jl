@@ -1,8 +1,10 @@
+import LinearAlgebra: mul!, transpose
+
 """
-    triangle_attention_tullio!(out, q, k, v, bias, mask=nothing)
+    triangle_attention_amx!(out, q, k, v, bias, mask=nothing)
 
 Computes multi-head triangle attention for pair representations. 
-Uses @tullio and @inbounds to generatie fast and efficient loops.
+Uses mul! to leverage the faster Accelerate framework on Apple silicon
 
 # Shapes
 - `q`, `k`, `v`: `[D, H, N, N, B]`
@@ -11,7 +13,7 @@ Uses @tullio and @inbounds to generatie fast and efficient loops.
 - `Returns`: `[D, H, N, N, B]`
 """
 # --- Main Kernel ---
-function triangle_attention_tullio!(
+function triangle_attention_amx!(
     out::AbstractArray{T, 5}, 
     q::AbstractArray{T, 5}, 
     k::AbstractArray{T, 5}, 
@@ -28,7 +30,7 @@ function triangle_attention_tullio!(
         max_workspace = Matrix{T}(undef, N, 1)
         sum_workspace = Matrix{T}(undef, N, 1)
         
-        @inbounds for h in 1:H
+        Threads.@threads for h in 1:H
             for i in 1:N
                 q_i = @view q[:, h, i, :, b] 
                 k_i = @view k[:, h, i, :, b]
@@ -36,8 +38,8 @@ function triangle_attention_tullio!(
                 out_i = @view out[:, h, i, :, b]
                 bias_slice = @view bias[h, :, :, b]
                 
-                _tullio_qk!(scores, q_i, k_i, scale)
-                @. scores += bias_slice
+                mul!(scores, transpose(q_i), k_i)
+                @. scores = (scores * scale) + bias_slice
                 
                 _apply_mask!(scores, mask, (i, :, b))
 
@@ -46,22 +48,10 @@ function triangle_attention_tullio!(
                 sum!(sum_workspace, exp_scores)
                 @. exp_scores = exp_scores / sum_workspace
 
-                _tullio_out!(out_i, v_i, exp_scores)
+                mul!(out_i, v_i, transpose(exp_scores))
             end
         end
     end
     
     return nothing
 end
-
-_tullio_qk!(scores, q_i, k_i, scale::T) where T = 
-    @tullio threads=false scores[j, k] = q_i[d, j] * k_i[d, k] * scale
-
-_tullio_qk!(scores, q_i, k_i, scale::Float16) = 
-    @tullio threads=false avx=false scores[j, k] = q_i[d, j] * k_i[d, k] * scale
-
-_tullio_out!(out_i, v_i, exp_scores::AbstractMatrix{T}) where T = 
-    @tullio threads=false out_i[d, j] = v_i[d, k] * exp_scores[j, k]
-
-_tullio_out!(out_i, v_i, exp_scores::AbstractMatrix{Float16}) = 
-    @tullio threads=false avx=false out_i[d, j] = v_i[d, k] * exp_scores[j, k]

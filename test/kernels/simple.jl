@@ -26,10 +26,10 @@ for T in [Float16, Float32, Float64]
             @testset "$name" begin
                 y_jl = _forward_jl(q, k, v, bias, mask)
                 
-                q_py, k_p, v_py = to_py(q), to_py(k), to_py(v)
+                q_py, k_py, v_py = to_py(q), to_py(k), to_py(v)
                 bias_py = to_py(permutedims(bias, (4, 1, 2, 3)); swap_batch_dim=false)
                 mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2)); swap_batch_dim=false)
-                y_py = py"attention_reference"(q_py, k_p, v_py, bias_py, mask_py)
+                y_py = py"attention_reference"(q_py, k_py, v_py, bias_py, mask_py)
 
                 @testset "Python parity" begin
                     @test y_jl ≈ to_jl(y_py)

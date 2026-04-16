@@ -1,16 +1,28 @@
 include("cpu/simple.jl")
 include("cpu/tullio.jl")
+include("cpu/amx.jl")
 include("gpu/generic.jl")
 include("gpu/cuda.jl")
 
+"""
+    triangle_attention(q, k, v, bias, mask=nothing)
+
+Computes multi-head triangle attention. 
+Automatically routes to the fastest backend based on the host CPU architecture.
+"""
 function triangle_attention(q, k, v, pair, mask=nothing)
     out = similar(q)
     triangle_attention!(out, q, k, v, pair, mask)
     return out
 end
 
-triangle_attention!(out::AbstractArray, args...) = 
-    triangle_attention_tullio!(out, args...)
+function triangle_attention!(out::AbstractArray, q, k, v, bias, mask=nothing)
+    if IS_APPLE_SILICON
+        triangle_attention_amx!(out, q, k, v, bias, mask)
+    else
+        triangle_attention_tullio!(out, q, k, v, bias, mask)
+    end
+end
 
 # triangle_attention!(out::CuArray, args...) = 
 #     triangle_attention_cuda!(out, args...)
