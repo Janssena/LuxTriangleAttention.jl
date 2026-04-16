@@ -11,36 +11,10 @@ const torch = pyimport("torch")
 py"""
 import numpy as np
 import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 import math
 from einops import rearrange, einsum
-
-def neg_inf(dtype) -> float:
-    return torch.finfo(dtype).min
-
-def triangle_attention_simple(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    bias: torch.Tensor,
-    mask: torch.Tensor = None,
-) -> torch.Tensor:
-    q = q * (q.shape[-1] ** -0.5)
-
-    qk_dot = einsum(q, k, "... h i j d, ... h i k d -> ... h i j k")
-
-    #                                                                                 i  j k
-    qk_dot_bias = qk_dot + rearrange(bias, "... h n m -> ... h () n m")
-    # This modifies qk_dot_bias in place.
-    qk_dot_bias.masked_fill_(
-        #                                              h  i j  k
-        rearrange(mask, "... n m -> ... () n () m"),
-        neg_inf(q.dtype),
-    )
-    a_ijk = torch.softmax(qk_dot_bias, dim=-1)
-
-    o_ij = einsum(a_ijk, v, "... h i j k, ... h i k d -> ... h i j d")
-
-    return o_ij
 
 def attention_reference(
     q: torch.Tensor,
@@ -59,21 +33,17 @@ def attention_reference(
     a = torch.matmul(q, k) * sm_scale  
 
     bias = rearrange(bias, "b h i j -> b () h i j")
-    a += bias
+    a.add_(bias) 
 
-    # CORRECTED POLARITY AND NONE-CHECK
     if mask is not None:
-        # 1.0 means valid (0 bias), 0.0 means invalid (-inf bias)
-        mask_bias = neg_inf(q.dtype) * (1.0 - mask.to(q.dtype))
-        mask_bias = rearrange(mask_bias, "b i j -> b i () () j")
-        a += mask_bias
+        mask = rearrange(mask, "b i j -> b i () () j")
+        # Assuming mask is 1.0 for valid, 0.0 for invalid
+        a.masked_fill_(mask == 0, torch.finfo(q.dtype).min)
 
     a = torch.softmax(a, dim=-1)
-    a_v = torch.matmul(a, v)
+    o = torch.matmul(a, v)
 
-    o = rearrange(a_v, "b i h j d -> b h i j d")
-
-    return o
+    return rearrange(o, "b i h j d -> b h i j d")
 """
 
 _swap_batch_dim(x::AbstractVector) = x
