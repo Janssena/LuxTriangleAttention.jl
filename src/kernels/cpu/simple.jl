@@ -3,12 +3,6 @@
 
 Computes multi-head triangle attention for pair representations. 
 Should only be used for benchmarking purposes.
-
-# Shapes
-- `q`, `k`, `v`: `[D, H, N, N, B]`
-- `bias`: `[H, N, N, B]` 
-- `mask`: `[N, N, B]`
-- `Returns`: `[D, H, N, N, B]`
 """
 function triangle_attention_simple!(
     out::AbstractArray{T, 5}, 

@@ -9,9 +9,26 @@ include("gpu/generic.jl")
 
 Computes multi-head triangle attention. Automatically routes to the fastest 
 backend based on the host CPU/GPU architecture.
+
+When set, the mask should either be the same float type as q, v, k, and bias
+or be an Array of Booleans. In both cases, 1 indicates attention while 0 
+results in masking at that index.
+
+# Shapes
+- `q`, `k`, `v`: `[D, H, N, N, B]`
+- `bias`: `[H, N, N, B]` 
+- `mask`: `[N, N, B]`
+- `Returns`: `[D, H, N, N, B]`
 """
 function triangle_attention end
 
+# TODO: We can potentially think about storing some variables in a cache output 
+# that we discard when calling triangle_attention, but collect in the specific 
+# call to the _backward! function. This way, we don't have to recompute the 
+# forward pass components in the backward function. Enzyme calls the forward
+# anyway, so currently we are doing 2x forward for one backward. This might be 
+# Difficult for looped versions (the cpu versions) since the exp_scores are 
+# different based on the indexes we are currently working with.
 function triangle_attention(q::Array, k, v, pair, mask=nothing; kwargs...)
     out = similar(q)
     triangle_attention!(out, q, k, v, pair, mask; kwargs...)

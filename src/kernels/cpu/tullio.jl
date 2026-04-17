@@ -2,15 +2,8 @@
     triangle_attention_tullio!(out, q, k, v, bias, mask)
 
 Computes multi-head triangle attention for pair representations. 
-Uses @tullio and @inbounds to generatie fast and efficient loops.
-
-# Shapes
-- `q`, `k`, `v`: `[D, H, N, N, B]`
-- `bias`: `[H, N, N, B]` 
-- `mask`: `[N, N, B]`
-- `Returns`: `[D, H, N, N, B]`
+Uses @tullio and @inbounds to generate fast and efficient loops.
 """
-# --- Main Kernel ---
 function triangle_attention_tullio!(
     out::AbstractArray{T, 5}, 
     q::AbstractArray{T, 5}, 
@@ -37,17 +30,17 @@ function triangle_attention_tullio!(
                 out_i = @view out[:, h, i, :, b]
                 bias_slice = @view bias[h, :, :, b]
                 
-                # 1. Matmul Q * K^T
+                # Matmul Q * K^T
                 _tullio_qk!(scores, q_i, k_i, scale)
                 
-                # 2. Add Bias
+                # Add Bias
                 @. scores += bias_slice
 
-                # 3. Apply Mask and Compute Softmax
+                # Apply Mask and Compute Softmax
                 _apply_mask!(scores, mask, (i, :, b); kwargs...)
                 _update_exp_scores!(exp_scores, max_workspace, sum_workspace, scores, mask, (i, :, b))
 
-                # 4. Matmul Softmax * V^T
+                # Matmul Softmax * V^T
                 _tullio_out!(out_i, v_i, exp_scores)
             end
         end

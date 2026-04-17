@@ -3,14 +3,8 @@ import LinearAlgebra: mul!, transpose
 """
     triangle_attention_amx!(out, q, k, v, bias, mask)
 
-Computes multi-head triangle attention for pair representations. 
-Uses mul! to leverage the faster Accelerate backend on Apple silicon.
-
-# Shapes
-- `q`, `k`, `v`: `[D, H, N, N, B]`
-- `bias`: `[H, N, N, B]` 
-- `mask`: `[N, N, B]`
-- `Returns`: `[D, H, N, N, B]`
+Computes multi-head triangle attention for pair representations. Uses mul! 
+instead of tullio to leverage the faster Accelerate backend on Apple silicon.
 """
 # --- Main Kernel ---
 function triangle_attention_amx!(

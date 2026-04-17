@@ -19,5 +19,9 @@ include("setup_python.jl");
         @testset "gpu" begin
             include("kernels/gpu.jl")
         end
+
+        @testset "gradients" begin
+            include("kernels/gradients.jl")
+        end
     end
 end

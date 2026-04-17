@@ -16,7 +16,7 @@ for T in [Float16, Float32, Float64]
 
         mask_cfg = (
             ("No mask", nothing),
-            ("Random mask", rand(rng, Bool[0, 1], N, N, B)),
+            ("Random mask", rand(rng, Bool, N, N, B)),
             ("All-ones mask", ones(Bool, N, N, B)),
         );
 

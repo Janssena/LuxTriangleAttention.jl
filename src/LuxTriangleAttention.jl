@@ -2,7 +2,7 @@ module LuxTriangleAttention
 
 const IS_APPLE_SILICON = Sys.isapple() && Sys.ARCH === :aarch64
 
-import Lux
+import Lux, Random
 
 using Tullio, LoopVectorization, NNlib, Enzyme, Enzyme.EnzymeRules, Static, PrecompileTools
 
@@ -12,14 +12,15 @@ export LayerNormNoBias
 include("kernels/kernels.jl");
 export triangle_attention
 export triangle_attention_simple!, triangle_attention_tullio!, triangle_attention_amx!
-export triangle_attention_amx_backward!, triangle_attention_tullio_backward!
+export triangle_attention_amx_backward!, triangle_attention_tullio_backward!, triangle_attention_gpu_backward!
 export triangle_attention_gpu
 
 include("layers/triangle_attention.jl");
 export TriangleAttention
 
+# Precompile attention kernels
 @setup_workload begin
-    D, H, N, B = 4, 2, 4, 1
+    D, H, N, B = 4, 2, 8, 1
     tri_attn_fn! = IS_APPLE_SILICON ? triangle_attention_amx! : triangle_attention_tullio!
     tri_attn_fn_backward! = IS_APPLE_SILICON ? triangle_attention_amx_backward! : triangle_attention_tullio_backward!
     # We want to precompile for Float32 since that is standard for ML
