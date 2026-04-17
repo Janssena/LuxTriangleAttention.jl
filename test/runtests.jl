@@ -1,10 +1,10 @@
 import Random
 
-using Test, TriangleAttention, BenchmarkTools, Metal
+using Test, LuxTriangleAttention, BenchmarkTools, Metal, FiniteDifferences
 
 include("setup_python.jl");
 
-@testset "TriangleAttention.jl" begin
+@testset "LuxTriangleAttention.jl" begin
     @testset "Kernels" begin
         @testset "Python parity" begin
             # This checks that our triangle_attention_simple! is correct so that we 

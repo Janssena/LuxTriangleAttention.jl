@@ -1,6 +1,6 @@
 import Random
 
-using Test, TriangleAttention, BenchmarkTools, Metal
+using Test, LuxTriangleAttention, BenchmarkTools, Metal
 
 include("setup_python.jl");
 
@@ -8,14 +8,14 @@ _forward_python(q, k, v, bias, mask) =
     py"attention_reference"(q, k, v, bias, mask)
 
 function _to_gpu(x...)
-    if TriangleAttention.IS_APPLE_SILICON
+    if LuxTriangleAttention.IS_APPLE_SILICON
         return x .|> MtlArray
     else
         return x
     end
 end
 
-@testset "TriangleAttention.jl" begin
+@testset "LuxTriangleAttention.jl" begin
     # setup
     rng = Random.Xoshiro(42)
     T = Float32
@@ -30,7 +30,7 @@ end
         k = randn(rng, T, D, H, N, N, B)
         v = randn(rng, T, D, H, N, N, B)
         bias = randn(rng, T, H, N, N, B)
-        mask = rand(rng, Bool[0, 1], N, N, B)
+        mask = rand(rng, Bool, N, N, B)
 
         q_py, k_py, v_py = to_py(q), to_py(k), to_py(v)
         bias_py = to_py(permutedims(bias, (4, 1, 2, 3)); swap_batch_dim=false)

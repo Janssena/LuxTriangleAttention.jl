@@ -44,3 +44,20 @@ function _apply_mask!(scores::AbstractArray{T, 2}, mask::AbstractArray{Bool, 3},
     @. scores = ifelse(mask_slice, scores, neg_inf)
     return nothing
 end
+
+function _update_exp_scores!(exp_scores::AbstractArray{T}, max_workspace, sum_workspace, scores, mask, idxs::Tuple) where T
+    maximum!(max_workspace, scores)
+    @. exp_scores = exp(scores - max_workspace)
+    _apply_scores_mask!(exp_scores, mask, idxs)
+    sum!(sum_workspace, exp_scores)
+    @. exp_scores = ifelse(sum_workspace > zero(T), exp_scores / sum_workspace, zero(T))
+
+    return nothing
+end
+
+_apply_scores_mask!(_, ::Nothing, idxs) = nothing
+function _apply_scores_mask!(exp_scores, mask, idxs) 
+    mask_slice = transpose(view(mask, idxs...))
+    @. exp_scores = exp_scores * mask_slice
+    return nothing
+end

@@ -7,7 +7,7 @@ function _forward_simple(q, k, v, bias, mask)
 end
 
 function _to_gpu(x...)
-    if TriangleAttention.IS_APPLE_SILICON
+    if LuxTriangleAttention.IS_APPLE_SILICON
         return x .|> MtlArray
     else
         return x
@@ -25,8 +25,8 @@ for T in [Float16, Float32]
 
         mask_cfg = (
             ("No mask", nothing),
-            ("Random mask", rand(rng, T[0, 1], N, N, B)),
-            ("All-ones mask", ones(T, N, N, B)),
+            ("Random mask", rand(rng, Bool, N, N, B)),
+            ("All-ones mask", ones(Bool, N, N, B)),
         );
 
         for (name, mask) in mask_cfg
