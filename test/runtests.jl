@@ -2,7 +2,8 @@ import Random
 
 using Test, LuxTriangleAttention, BenchmarkTools, Metal, FiniteDifferences
 
-include("setup_python.jl");
+include("python/setup.jl");
+include("python/attention_reference.jl");
 
 @testset "LuxTriangleAttention.jl" begin
     @testset "Kernels" begin
