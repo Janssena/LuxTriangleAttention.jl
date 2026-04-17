@@ -1,6 +1,6 @@
 module LuxTriangleAttentionMetalExt
 
-import NNlib
+import Lux
 import LinearAlgebra: mul!
 
 using LuxTriangleAttention: LuxTriangleAttention, triangle_attention_gpu
@@ -21,7 +21,7 @@ function metal_batched_mul(A::MtlArray{Float32, 3}, B::MtlArray{Float32, 3})
 end
 
 # Fallback to standard NNlib implementation for all other types
-metal_batched_mul(A, B) = NNlib.batched_mul(A, B)
+metal_batched_mul(A, B) = Lux.batched_matmul(A, B)
 
 LuxTriangleAttention.triangle_attention(
     q::MtlArray{T, 5}, k::MtlArray{T, 5}, v::MtlArray{T, 5}, 

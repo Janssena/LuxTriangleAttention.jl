@@ -11,7 +11,7 @@ function triangle_attention_gpu(
     bias::AbstractArray{T, 4}, 
     mask::Union{Nothing, AbstractArray{T, 3}, AbstractArray{Bool, 3}};
     neg_inf = -_safe_inf(T),
-    bmul = NNlib.batched_mul
+    bmul = Lux.batched_matmul
 ) where T
     D, H, N, _, B = size(q)
     scale = eltype(q)(1.0 / sqrt(D))
@@ -61,7 +61,7 @@ end
     triangle_attention_gpu_backward!(dq, dk, dv, dbias, dout, q, k, v, bias, mask; kwargs...)
 
 Cache-free GPU backward pass. Recomputes softmax scores on the fly and uses high-level 
-array operations (batched_mul, permutedims) to ensure compatibility with GPU libraries.
+array operations (batched_matmul, permutedims) to ensure compatibility with GPU libraries.
 """
 triangle_attention_gpu_backward!(dq, dk, dv, dbias, dout, q, k, v, bias, mask; kwargs...) =
     _triangle_attention_gpu_backward!(dq, dk, dv, dbias, dout, q, k, v, bias, mask; kwargs...)
@@ -74,7 +74,7 @@ function _triangle_attention_gpu_backward!(
     q::AbstractArray{T, 5}, k::AbstractArray{T, 5}, v::AbstractArray{T, 5}, bias::AbstractArray{T, 4}, 
     mask::Union{Nothing, AbstractArray{T, 3}, AbstractArray{Bool, 3}};
     neg_inf = -_safe_inf(T),
-    bmul = NNlib.batched_mul
+    bmul = Lux.batched_matmul
 ) where T
     D, H, N, _, B = size(q)
     scale = T(1.0 / sqrt(D))
