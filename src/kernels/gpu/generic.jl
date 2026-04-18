@@ -10,7 +10,7 @@ function triangle_attention_gpu(
     v::AbstractArray{T, 5}, 
     bias::AbstractArray{T, 4}, 
     mask::Union{Nothing, AbstractArray{T, 3}, AbstractArray{Bool, 3}};
-    neg_inf = -_safe_inf(T),
+    neginf = -_safe_inf(T),
     bmul = Lux.batched_matmul
 ) where T
     D, H, N, _, B = size(q)
@@ -41,12 +41,12 @@ function triangle_attention_gpu(
 
         @. scores_5d = ifelse(
             iszero(mask_reshaped), 
-            neg_inf, 
+            neginf, 
             (scores_5d * scale) + bias_reshaped
         )
     end
 
-    NNlib.softmax!(scores_5d, scores_5d, dims=2)
+    Lux.softmax!(scores_5d, scores_5d, dims=2)
 
     attn_batch = reshape(scores_5d, N, N, batch_size)    
     attn_batch_T = permutedims(attn_batch, (2, 1, 3))
@@ -73,7 +73,7 @@ function _triangle_attention_gpu_backward!(
     dout::AbstractArray{T, 5}, 
     q::AbstractArray{T, 5}, k::AbstractArray{T, 5}, v::AbstractArray{T, 5}, bias::AbstractArray{T, 4}, 
     mask::Union{Nothing, AbstractArray{T, 3}, AbstractArray{Bool, 3}};
-    neg_inf = -_safe_inf(T),
+    neginf = -_safe_inf(T),
     bmul = Lux.batched_matmul
 ) where T
     D, H, N, _, B = size(q)
@@ -104,7 +104,7 @@ function _triangle_attention_gpu_backward!(
 
         @. scores_5d = ifelse(
             iszero(mask_reshaped), 
-            neg_inf, 
+            neginf, 
             (scores_5d * scale) + bias_reshaped
         )
     end

@@ -16,8 +16,8 @@ function TriangleAttention(
 ) 
     return TriangleAttention(
         static(!is_starting),
-        Lux.LayerNorm((chn_in, 1, 1)),
-        Lux.Dense(chn_in => num_heads; use_bias=use_bias),
+        Lux.LayerNorm((chn_in, 1, 1)), # AF2, AF3, and Boltz2 all use use_bias=true
+        Lux.Dense(chn_in => num_heads; use_bias=use_bias), # AF2 uses use_bias=false
         TriAttnCore(chn_in, chn_hidden, num_heads; inf, kwargs...),
     )
 end

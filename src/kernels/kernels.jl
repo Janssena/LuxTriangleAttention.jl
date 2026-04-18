@@ -49,16 +49,16 @@ _safe_inf(::Type{T}) where T<:AbstractFloat = T(1e9)
 _safe_inf(::Type{Float16}) = Float16(1e4)
 
 _apply_mask!(_, ::Nothing, idxs) = nothing
-function _apply_mask!(scores::AbstractArray{T, 2}, mask::AbstractArray{T, 3}, idxs::Tuple; neg_inf=-_safe_inf(T)) where T
+function _apply_mask!(scores::AbstractArray{T, 2}, mask::AbstractArray{T, 3}, idxs::Tuple; neginf=-_safe_inf(T)) where T
     mask_slice = transpose(view(mask, idxs...))
-    @. scores = ifelse(mask_slice == zero(T), neg_inf, scores)
+    @. scores = ifelse(mask_slice == zero(T), neginf, scores)
     return nothing
 end
 
 # TODO: Should we be using AbstractArray{Bool} for masks?
-function _apply_mask!(scores::AbstractArray{T, 2}, mask::AbstractArray{Bool, 3}, idxs::Tuple; neg_inf=-_safe_inf(T)) where T
+function _apply_mask!(scores::AbstractArray{T, 2}, mask::AbstractArray{Bool, 3}, idxs::Tuple; neginf=-_safe_inf(T)) where T
     mask_slice = transpose(view(mask, idxs...))
-    @. scores = ifelse(mask_slice, scores, neg_inf)
+    @. scores = ifelse(mask_slice, scores, neginf)
     return nothing
 end
 

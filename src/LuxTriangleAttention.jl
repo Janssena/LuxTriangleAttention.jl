@@ -16,7 +16,8 @@ export triangle_attention_amx_backward!, triangle_attention_tullio_backward!, tr
 export triangle_attention_gpu
 
 include("layers/triangle_attention.jl");
-export TriangleAttention
+include("layers/tri_attn_core.jl");
+export TriangleAttention, TriAttnCore
 
 # Precompile attention kernels
 @setup_workload begin

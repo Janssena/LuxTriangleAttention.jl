@@ -14,7 +14,7 @@ TriAttnCore(chn_in::Int, chn_hidden::Int, num_heads::Int; kwargs...) =
 
 function TriAttnCore(
     chn_q::Int, chn_k::Int, chn_v::Int, chn_hidden::Int, num_heads::Int;
-    inf::Real=_safe_inf(Float32), gate::Bool=true, qkv_use_bias::Bool=true, 
+    inf::Real=_safe_inf(Float32), gate::Bool=true, qkv_use_bias::Bool=false, 
     gate_use_bias::Bool=true, out_use_bias::Bool=true
 ) 
     return TriAttnCore(
@@ -58,7 +58,7 @@ function _tri_attn_core_forward(m::TriAttnCore, x, bias, mask, ps, st)
     _v, linear_v = m.linear_v(x, ps.linear_v, st.linear_v) # [DxH, N, N, B]
     q, k, v = map(Base.Fix2(reshape, qkv_dims), (_q, _k, _v)) # [D, H, N, N, B]
 
-    out = triangle_attention(q, k, v, bias, mask; neg_inf = -st.inf) # [D, H, N, N, B]
+    out = triangle_attention(q, k, v, bias, mask; neginf = -st.inf) # [D, H, N, N, B]
     out = reshape(out, (m.chn_hidden * m.num_heads, N, N, B)) # [DxH, N, N, B]
     out, gate = __tri_attn_gate_maybe(m.gate, out, x, ps.gate, st.gate) # [DxH, N, N, B]
 
