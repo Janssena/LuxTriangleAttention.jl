@@ -36,14 +36,17 @@ function sync_dense!(py::PyObject, jl::NamedTuple)
     @assert (py"hasattr"(py, "bias") && !isnothing(py.bias)) == (:bias in keys(jl)) "PyObject and NamedTuple have non-matching bias attributes."
 
     copy_jl_ps_to_py!(py.weight, jl.weight)
-    if :bias in keys(jl) && py"hasattr"(py_attn.linear_q, "bias")
+    if :bias in keys(jl) && (py"hasattr"(py, "bias") && !isnothing(py.bias))
         copy_jl_ps_to_py!(py.bias, jl.bias)
     end
 end
 
-# function sync_layernorm!(py::PyObject, jl::NamedTuple)
-#     copy_jl_ps_to_py!(py.weight, jl.weight)
-#     if :bias in keys(jl)
-#         copy_jl_ps_to_py!(py.scale, jl.bias)
-#     end
-# end
+function sync_layernorm!(py::PyObject, jl::NamedTuple)
+    @assert py"hasattr"(py, "weight") "PyObject does not have weight attribute."
+    @assert (py"hasattr"(py, "bias") && !isnothing(py.bias)) == (:bias in keys(jl)) "PyObject and NamedTuple have non-matching bias attributes."
+
+    copy_jl_ps_to_py!(py.weight, vec(jl.scale))
+    if :bias in keys(jl) && (py"hasattr"(py, "bias") && !isnothing(py.bias))
+        copy_jl_ps_to_py!(py.bias, vec(jl.bias))
+    end
+end

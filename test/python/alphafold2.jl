@@ -15,20 +15,13 @@ def af2_flatten_final_dims(t: torch.Tensor, no_dims: int):
     return t.reshape(t.shape[:-no_dims] + (-1,))
 
 def _af2_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, biases: List[torch.Tensor]) -> torch.Tensor:
-    print('q', query.shape)
-    print('mask', biases[0].shape)
-    print('bias', biases[1].shape)
     key = af2_permute_final_dims(key, (1, 0))
     a = torch.matmul(query, key)
-    print('a', a.shape)
     for b in biases:
         a += b
-        print('here')
     
     a = nn.functional.softmax(a, dim=-1)
-    print('maybe')
     a = torch.matmul(a, value)
-    print('there')
     return a
 
 class AF2Attention(nn.Module):
