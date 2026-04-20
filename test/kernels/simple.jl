@@ -24,13 +24,13 @@ for T in [Float16, Float32, Float64]
             @testset "$name" begin
                 y_jl = _forward_jl(q, k, v, bias, mask)
                 
-                q_py, k_py, v_py = to_py(q), to_py(k), to_py(v)
+                q_py, k_py, v_py = to_py(q; swap_batch_dim=true), to_py(k; swap_batch_dim=true), to_py(v; swap_batch_dim=true)
                 bias_py = to_py(permutedims(bias, (4, 1, 2, 3)); swap_batch_dim=false)
                 mask_py = isnothing(mask) ? nothing : to_py(permutedims(T.(mask), (3, 1, 2)); swap_batch_dim=false)
                 y_py = py"attention_reference"(q_py, k_py, v_py, bias_py, mask_py)
 
                 @testset "Python parity" begin
-                    @test y_jl ≈ to_jl(y_py)
+                    @test y_jl ≈ to_jl(y_py; swap_batch_dim=true)
                 end
 
                 @testset "Type-stability" begin
