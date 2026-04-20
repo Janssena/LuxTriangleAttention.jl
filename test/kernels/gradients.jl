@@ -15,27 +15,27 @@
         @testset "$name" begin
             out = zeros(T, size(q))
             # Enzyme will accumulate the gradients directly into these arrays.
-            dq_amx_enzyme = zeros(T, size(q))
-            dk_amx_enzyme = zeros(T, size(k))
-            dv_amx_enzyme = zeros(T, size(v))
-            dbias_amx_enzyme = zeros(T, size(bias))
+            dq_amx = zeros(T, size(q))
+            dk_amx = zeros(T, size(k))
+            dv_amx = zeros(T, size(v))
+            dbias_amx = zeros(T, size(bias))
 
-            dq_tullio_enzyme = zeros(T, size(q))
-            dk_tullio_enzyme = zeros(T, size(k))
-            dv_tullio_enzyme = zeros(T, size(v))
-            dbias_tullio_enzyme = zeros(T, size(bias))
+            dq_tullio = zeros(T, size(q))
+            dk_tullio = zeros(T, size(k))
+            dv_tullio = zeros(T, size(v))
+            dbias_tullio = zeros(T, size(bias))
 
-            dq_gpu_enzyme = zeros(T, size(q))
-            dk_gpu_enzyme = zeros(T, size(k))
-            dv_gpu_enzyme = zeros(T, size(v))
-            dbias_gpu_enzyme = zeros(T, size(bias))
+            dq_gpu = zeros(T, size(q))
+            dk_gpu = zeros(T, size(k))
+            dv_gpu = zeros(T, size(v))
+            dbias_gpu = zeros(T, size(bias))
             
             dout = ones(T, size(out)) 
 
-            println("Running Enzyme backward rules...")
-            triangle_attention_amx_backward!(dq_amx_enzyme, dk_amx_enzyme, dv_amx_enzyme, dbias_amx_enzyme, dout, copy(q), copy(k), copy(v), copy(bias), mask)
-            triangle_attention_tullio_backward!(dq_tullio_enzyme, dk_tullio_enzyme, dv_tullio_enzyme, dbias_tullio_enzyme, dout, copy(q), copy(k), copy(v), copy(bias), mask)
-            triangle_attention_gpu_backward!(dq_gpu_enzyme, dk_gpu_enzyme, dv_gpu_enzyme, dbias_gpu_enzyme, dout, copy(q), copy(k), copy(v), copy(bias), mask)
+            println("Running kernel backward functions...")
+            triangle_attention_amx_backward!(dq_amx, dk_amx, dv_amx, dbias_amx, dout, copy(q), copy(k), copy(v), copy(bias), mask)
+            triangle_attention_tullio_backward!(dq_tullio, dk_tullio, dv_tullio, dbias_tullio, dout, copy(q), copy(k), copy(v), copy(bias), mask)
+            triangle_attention_gpu_backward!(dq_gpu, dk_gpu, dv_gpu, dbias_gpu, dout, copy(q), copy(k), copy(v), copy(bias), mask)
 
             function loss_fn(q_, k_, v_, bias_; _mask=mask)
                 out_temp = similar(q_)
@@ -52,21 +52,21 @@
             dv_fd = grads_fd[3]
             dbias_fd = grads_fd[4]
 
-            @testset "Enzyme Gradient Matching ($name, precision = $T)" begin
-                @test dq_amx_enzyme ≈ dq_fd
-                @test dk_amx_enzyme ≈ dk_fd
-                @test dv_amx_enzyme ≈ dv_fd
-                @test dbias_amx_enzyme ≈ dbias_fd
+            @testset "Gradient parity for custom backward fuctions ($name, precision = $T)" begin
+                @test dq_amx ≈ dq_fd
+                @test dk_amx ≈ dk_fd
+                @test dv_amx ≈ dv_fd
+                @test dbias_amx ≈ dbias_fd
 
-                @test dq_tullio_enzyme ≈ dq_fd
-                @test dk_tullio_enzyme ≈ dk_fd
-                @test dv_tullio_enzyme ≈ dv_fd
-                @test dbias_tullio_enzyme ≈ dbias_fd
+                @test dq_tullio ≈ dq_fd
+                @test dk_tullio ≈ dk_fd
+                @test dv_tullio ≈ dv_fd
+                @test dbias_tullio ≈ dbias_fd
 
-                @test dq_gpu_enzyme ≈ dq_fd
-                @test dk_gpu_enzyme ≈ dk_fd
-                @test dv_gpu_enzyme ≈ dv_fd
-                @test dbias_gpu_enzyme ≈ dbias_fd
+                @test dq_gpu ≈ dq_fd
+                @test dk_gpu ≈ dk_fd
+                @test dv_gpu ≈ dv_fd
+                @test dbias_gpu ≈ dbias_fd
             end
         end
     end
