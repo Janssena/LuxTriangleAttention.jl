@@ -3,10 +3,11 @@ import Random
 using Test, LuxTriangleAttention, BenchmarkTools, Metal, FiniteDifferences
 
 include("python/setup.jl");
-include("python/attention_reference.jl");
 
 @testset "LuxTriangleAttention.jl" begin
     @testset "Kernels" begin
+        include("python/attention_reference.jl");
+        
         @testset "Python parity" begin
             # This checks that our triangle_attention_simple! is correct so that we 
             # can use it instead of the python function for downstream parity checks
@@ -24,5 +25,9 @@ include("python/attention_reference.jl");
         @testset "gradients" begin
             include("kernels/gradients.jl")
         end
+    end
+
+    @testset "Layers" begin
+        include("layers/runtests.jl")
     end
 end

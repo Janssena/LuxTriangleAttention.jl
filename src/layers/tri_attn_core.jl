@@ -15,7 +15,7 @@ TriAttnCore(chn_in::Int, chn_hidden::Int, num_heads::Int; kwargs...) =
 function TriAttnCore(
     chn_q::Int, chn_k::Int, chn_v::Int, chn_hidden::Int, num_heads::Int;
     inf::Real=_safe_inf(Float32), gate::Bool=true, qkv_use_bias::Bool=false, 
-    gate_use_bias::Bool=true, out_use_bias::Bool=true
+    gate_use_bias::Bool=false, out_use_bias::Bool=false
 ) 
     return TriAttnCore(
         Lux.Dense(chn_q => chn_hidden * num_heads; use_bias=qkv_use_bias),

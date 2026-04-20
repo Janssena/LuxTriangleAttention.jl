@@ -1,6 +1,6 @@
-include("../python/alphafold2.jl")
+include("../python/boltz2.jl")
 
-function copy_weights_to_af2_attention!(
+function copy_weights_to_boltz2_attention!(
     py_layer::PyObject,
     ps::NamedTuple
 )   
@@ -16,19 +16,18 @@ function copy_weights_to_af2_attention!(
     return nothing
 end
 
-function copy_weights_to_af2_triangle_attention!(
+function copy_weights_to_boltz2_triangle_attention!(
     py_layer::PyObject,
     ps::NamedTuple
 )   
-    # TODO: add all layers
     sync_layernorm!(py_layer.layer_norm, ps.layer_norm)
     sync_dense!(py_layer.linear, ps.linear)
-    copy_weights_to_af2_attention!(py_layer.mha, ps.mha)
+    copy_weights_to_boltz2_attention!(py_layer.mha, ps.mha)
 
     return nothing
 end
 
-@testset "AlphaFold2" begin
+@testset "Boltz2" begin
     # setup
     rng = Random.Xoshiro(42)
     T = Float32
@@ -45,30 +44,31 @@ end
     )
     
     for (name, mask) in mask_cfg
-        @testset "TriAttnCore ($name)" begin
-            jl_layer = TriAttnCore(chn_in, chn_hidden, num_heads; inf=inf_val, qkv_use_bias=false, gate_use_bias=true, out_use_bias=true)
+        @testset "Boltz2 TriAttnCore ($name)" begin
+            jl_layer = TriAttnCore(chn_in, chn_hidden, num_heads; inf=inf_val, qkv_use_bias=false, gate_use_bias=false, out_use_bias=false)
             ps, st = LuxTriangleAttention.Lux.setup(rng, jl_layer)
     
-            py_layer = py"AF2Attention"(chn_in, chn_in, chn_in, chn_hidden, num_heads)
+            py_layer = py"Boltz2Attention"(chn_in, chn_in, chn_in, chn_hidden, num_heads)
     
-            copy_weights_to_af2_attention!(py_layer, ps)
+            copy_weights_to_boltz2_attention!(py_layer, ps)
     
             y_jl, _ = jl_layer(x, bias, mask, ps, st)
     
             x_py = to_py(x; swap_batch_dim=true)
+            
             if !isnothing(mask)
                 mask_py = to_py(permutedims(mask, (3, 1, 2)))
-                mask_py = inf_val * (mask_py - 1) # [B, N, N] 
+                mask_py = inf_val * (mask_py - 1) # [B, N, N]
             else
                 mask_py = nothing
             end
-            bias_py = to_py(bias; swap_batch_dim=true)
+            bias_py = to_py(bias; swap_batch_dim=true) # [B, H, N, N]
             
             py"""
             # mask in expected: [B, N, N]
-            # bias in expected: [B, N, N, H]
-            triangle_bias = af2_permute_final_dims($bias_py, (2, 0, 1))
-            triangle_bias = triangle_bias.unsqueeze(-4) # [B, 1, H, N, N]
+            # tri_bias in expected: [B, N, N, H]
+            tri_bias = boltz2_permute_final_dims($bias_py, (2, 0, 1))
+            tri_bias = tri_bias.unsqueeze(-4) # [B, 1, H, N, N]
             if $mask_py is None:
                 mask = $x_py.new_ones($x_py.shape[:-1])
                 mask = $inf_val * (mask - 1)
@@ -76,40 +76,39 @@ end
                 mask = $mask_py
                 
             mask_bias = mask[..., :, None, None, :] # [B, N, 1, 1, N]
-            biases = [mask_bias, triangle_bias]
             """
             
             py_layer.eval()
-            py_out = py_layer(x_py, x_py; biases=py"biases")
+            py_out = py_layer(x_py, x_py, py"tri_bias", py"mask_bias", py"mask"; use_kernels=false)
     
             @testset "Parity" begin
                 @test y_jl ≈ to_jl(py_out; swap_batch_dim=true)
             end
-    
+
             @testset "Type-stability" begin
                 @test_nowarn @inferred jl_layer(x, bias, mask, ps, st)
             end
         end
     
-        @testset "TriangleAttention ($name)" begin
+        @testset "Boltz2 TriangleAttention ($name)" begin
             for is_starting in [true, false]
-                jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=true, out_use_bias=true)
+                jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=false, out_use_bias=false)
                 ps, st = LuxTriangleAttention.Lux.setup(rng, jl_layer)
     
-                py_layer = py"AF2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
-                copy_weights_to_af2_triangle_attention!(py_layer, ps)
+                py_layer = py"Boltz2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
+                copy_weights_to_boltz2_triangle_attention!(py_layer, ps)
                 py_layer.eval()
                 
                 x_py = to_py(x; swap_batch_dim=true)
                 mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2)))
                 
                 y_jl, _ = jl_layer(x, mask, ps, st)
-                py_out = py_layer(x_py, mask_py)
+                py_out = py_layer(x_py, mask_py; use_kernels=false)
     
                 @testset "Parity" begin
                     @test y_jl ≈ to_jl(py_out; swap_batch_dim=true)
                 end
-    
+
                 @testset "Type-stability" begin
                     @test_nowarn @inferred jl_layer(x, mask, ps, st)
                 end
