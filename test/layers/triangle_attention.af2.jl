@@ -33,7 +33,7 @@ end
     rng = Random.Xoshiro(42)
     T = Float32
     chn_in, N, B = 64, 8, 2
-    chn_hidden = 16 # == D
+    chn_hidden = 32 # == D
     num_heads = 4 # == H
     inf_val = LuxTriangleAttention._safe_inf(T)
     
@@ -47,7 +47,7 @@ end
     for (name, mask) in mask_cfg
         @testset "TriAttnCore ($name)" begin
             jl_layer = TriAttnCore(chn_in, chn_hidden, num_heads; inf=inf_val, qkv_use_bias=false, gate_use_bias=true, out_use_bias=true)
-            ps, st = LuxTriangleAttention.Lux.setup(rng, jl_layer)
+            ps, st = Lux.setup(rng, jl_layer)
     
             py_layer = py"AF2Attention"(chn_in, chn_in, chn_in, chn_hidden, num_heads)
     
@@ -57,7 +57,7 @@ end
     
             x_py = to_py(x; swap_batch_dim=true)
             if !isnothing(mask)
-                mask_py = to_py(permutedims(mask, (3, 1, 2)))
+                mask_py = to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T)) # Needs to be float
                 mask_py = inf_val * (mask_py - 1) # [B, N, N] 
             else
                 mask_py = nothing
@@ -94,14 +94,14 @@ end
         @testset "TriangleAttention ($name)" begin
             for is_starting in [true, false]
                 jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=true, out_use_bias=true)
-                ps, st = LuxTriangleAttention.Lux.setup(rng, jl_layer)
+                ps, st = Lux.setup(rng, jl_layer)
     
                 py_layer = py"AF2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
+
                 copy_weights_to_af2_triangle_attention!(py_layer, ps)
-                py_layer.eval()
                 
                 x_py = to_py(x; swap_batch_dim=true)
-                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2)))
+                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T)) # Needs to be float
                 
                 y_jl, _ = jl_layer(x, mask, ps, st)
                 py_out = py_layer(x_py, mask_py)

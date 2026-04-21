@@ -32,7 +32,7 @@ end
     rng = Random.Xoshiro(42)
     T = Float32
     chn_in, N, B = 64, 8, 2
-    chn_hidden = 16 # == D
+    chn_hidden = 32 # == D
     num_heads = 4 # == H
     inf_val = LuxTriangleAttention._safe_inf(T)
     
@@ -46,7 +46,7 @@ end
     for (name, mask) in mask_cfg
         @testset "Boltz2 TriAttnCore ($name)" begin
             jl_layer = TriAttnCore(chn_in, chn_hidden, num_heads; inf=inf_val, qkv_use_bias=false, gate_use_bias=false, out_use_bias=false)
-            ps, st = LuxTriangleAttention.Lux.setup(rng, jl_layer)
+            ps, st = Lux.setup(rng, jl_layer)
     
             py_layer = py"Boltz2Attention"(chn_in, chn_in, chn_in, chn_hidden, num_heads)
     
@@ -93,7 +93,7 @@ end
         @testset "Boltz2 TriangleAttention ($name)" begin
             for is_starting in [true, false]
                 jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=false, out_use_bias=false)
-                ps, st = LuxTriangleAttention.Lux.setup(rng, jl_layer)
+                ps, st = Lux.setup(rng, jl_layer)
     
                 py_layer = py"Boltz2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
                 copy_weights_to_boltz2_triangle_attention!(py_layer, ps)
