@@ -4,7 +4,7 @@ const IS_APPLE_SILICON = Sys.isapple() && Sys.ARCH === :aarch64
 
 import Lux, Random
 
-using Tullio, LoopVectorization, NNlib, Enzyme, Enzyme.EnzymeRules, Static, PrecompileTools
+using Tullio, LoopVectorization, Enzyme, Enzyme.EnzymeRules, Static
 
 include("layers/primitives.jl");
 export LayerNormNoBias, GatedLinearUnit, SwiGLU

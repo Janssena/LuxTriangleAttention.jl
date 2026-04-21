@@ -65,7 +65,7 @@ array operations (batched_matmul, permutedims) to ensure compatibility with GPU 
 """
 triangle_attention_gpu_backward!(dq, dk, dv, dbias, dout, q, k, v, bias, mask; kwargs...) =
     _triangle_attention_gpu_backward!(dq, dk, dv, dbias, dout, q, k, v, bias, mask; kwargs...)
-# The above allows us to call metal_batched_mul instead of NNlib.batched_mul for Float32
+# The above allows us to call metal_batched_mul instead of Lux.batched_matmul for Float32
 
 
 function _triangle_attention_gpu_backward!(
@@ -109,7 +109,7 @@ function _triangle_attention_gpu_backward!(
         )
     end
 
-    NNlib.softmax!(scores_5d, scores_5d, dims=2)
+    Lux.softmax!(scores_5d, scores_5d, dims=2)
 
     # ==========================================================
     #   Backward Pass

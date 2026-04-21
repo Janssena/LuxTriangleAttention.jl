@@ -6,7 +6,7 @@ import LinearAlgebra: mul!
 using LuxTriangleAttention: LuxTriangleAttention, triangle_attention_gpu
 using Metal, Enzyme, Enzyme.EnzymeRules
 
-# Patch for missing Float32 implementation of NNlib batched_mul for Metal.jl
+# Patch for missing Float32 implementation of batched_matmul for Metal.jl
 function metal_batched_mul(A::MtlArray{Float32, 3}, B::MtlArray{Float32, 3})
     M, _, B_dim = size(A)
     _, N, _ = size(B)
@@ -20,7 +20,7 @@ function metal_batched_mul(A::MtlArray{Float32, 3}, B::MtlArray{Float32, 3})
     return C
 end
 
-# Fallback to standard NNlib implementation for all other types
+# Fallback to standard Lux.batched_matmul implementation for all other types
 metal_batched_mul(A, B) = Lux.batched_matmul(A, B)
 
 LuxTriangleAttention.triangle_attention(
