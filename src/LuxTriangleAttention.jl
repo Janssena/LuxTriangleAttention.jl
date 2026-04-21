@@ -6,8 +6,8 @@ import Lux, Random
 
 using Tullio, LoopVectorization, Enzyme, Enzyme.EnzymeRules, Static, PrecompileTools
 
-include("layers/primitives.jl");
-export LayerNormNoBias, GatedLinearUnit, SwiGLU
+include("layers/glu.jl");
+export GatedLinearUnit, SwiGLU
 
 include("kernels/kernels.jl");
 export triangle_attention
