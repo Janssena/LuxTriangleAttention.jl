@@ -2,7 +2,7 @@
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
+LuxTriangleAttention = "3d5d7496-9328-4173-860c-6da38a33fff6"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 PyCall = "438e738f-606a-5dbb-bf0a-cddfbfd45ab0"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-LuxTriangleAttention = "3d5d7496-9328-4173-860c-6da38a33fff6"

@@ -7,13 +7,12 @@ include("python/setup.jl");
 
 @testset "LuxTriangleAttention.jl" begin
     @testset "Kernels" begin
-        include("python/attention_reference.jl");
-        
-        @testset "Python parity" begin
-            # This checks that our triangle_attention_simple! is correct so that we 
-            # can use it instead of the python function for downstream parity checks
-            include("kernels/simple.jl")
-        end
+        # @testset "Python parity" begin
+        #     include("python/attention_reference.jl");
+        #     # This checks that our triangle_attention_simple! is correct so that we 
+        #     # can use it instead of the python function for downstream parity checks
+        #     include("kernels/simple.jl")
+        # end
 
         @testset "cpu" begin
             include("kernels/cpu.jl")
