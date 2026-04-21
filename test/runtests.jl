@@ -1,3 +1,4 @@
+import LuxTriangleAttention: Lux
 import Random
 
 using Test, LuxTriangleAttention, BenchmarkTools, Metal, FiniteDifferences

@@ -11,23 +11,22 @@ end
 
 function TriMulCore(
     chn_in::Int, chn_hidden::Int;
-    fused::Union{<:StaticBool,Bool}=static(true), 
     is_outgoing::Union{Bool, StaticBool}=static(true),
+    fused::Union{<:StaticBool,Bool}=static(true), 
+    fused_glu::Union{<:StaticBool,Bool}=static(true),
     layernorm_eps=1f-5, use_bias=false, kwargs...
 )   
     fused_static = static(fused)
-    dir_static = static(is_outgoing)
     
-    # Use regular boolean for constructor-time if logic
     if known(fused_static)
-        # Fuses p_a, p_b, g_a, g_b into a single operation (Dense to 4H)
-        glu_ab = GatedLinearUnit(chn_in => 2 * chn_hidden; fused=true, use_bias)
+        # Fuses p_a, p_b, g_a, g_b into a single operation (Dense to 2H/4H depending on chn_hidden)
+        glu_ab = GatedLinearUnit(chn_in => 2 * chn_hidden; fused=fused_glu, use_bias)
         glu_a = Lux.NoOpLayer()
         glu_b = Lux.NoOpLayer()
     else
         glu_ab = Lux.NoOpLayer()
-        glu_a = GatedLinearUnit(chn_in => chn_hidden; fused=true, use_bias)
-        glu_b = GatedLinearUnit(chn_in => chn_hidden; fused=true, use_bias)
+        glu_a = GatedLinearUnit(chn_in => chn_hidden; fused=fused_glu, use_bias)
+        glu_b = GatedLinearUnit(chn_in => chn_hidden; fused=fused_glu, use_bias)
     end
 
     layer_norm_out = Lux.LayerNorm((chn_hidden, 1, 1); dims=1, epsilon=layernorm_eps)
@@ -37,7 +36,7 @@ function TriMulCore(
 
     return TriMulCore(
         fused_static,
-        dir_static,
+        static(is_outgoing),
         glu_ab, glu_a, glu_b,
         layer_norm_out,
         glu_out,

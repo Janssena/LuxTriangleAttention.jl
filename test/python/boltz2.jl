@@ -184,4 +184,58 @@ class Boltz2TriangleAttentionEndingNode(Boltz2TriangleAttention):
     def __init__(self, *args, **kwargs):
         kwargs["starting"] = False
         super().__init__(*args, **kwargs)
+
+
+class Boltz2TriangleMultiplicationOutgoing(nn.Module):
+    def __init__(self, dim: int = 128) -> None:
+        super().__init__()
+        self.norm_in = nn.LayerNorm(dim, eps=1e-5)
+        self.p_in = nn.Linear(dim, 2 * dim, bias=False)
+        self.g_in = nn.Linear(dim, 2 * dim, bias=False)
+
+        self.norm_out = nn.LayerNorm(dim)
+        self.p_out = nn.Linear(dim, dim, bias=False)
+        self.g_out = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = self.norm_in(x)
+        x_in = x
+        x = self.p_in(x) * self.g_in(x).sigmoid()
+
+        x = x * mask.unsqueeze(-1)
+
+        a, b = torch.chunk(x.float(), 2, dim=-1)
+
+        x = torch.einsum("bikd,bjkd->bijd", a, b)
+
+        x = self.p_out(self.norm_out(x)) * self.g_out(x_in).sigmoid()
+
+        return x
+
+
+class Boltz2TriangleMultiplicationIncoming(nn.Module):
+    def __init__(self, dim: int = 128) -> None:
+        super().__init__()
+        self.norm_in = nn.LayerNorm(dim, eps=1e-5)
+        self.p_in = nn.Linear(dim, 2 * dim, bias=False)
+        self.g_in = nn.Linear(dim, 2 * dim, bias=False)
+
+        self.norm_out = nn.LayerNorm(dim)
+        self.p_out = nn.Linear(dim, dim, bias=False)
+        self.g_out = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        x = self.norm_in(x)
+        x_in = x
+        x = self.p_in(x) * self.g_in(x).sigmoid()
+
+        x = x * mask.unsqueeze(-1)
+
+        a, b = torch.chunk(x.float(), 2, dim=-1)
+
+        x = torch.einsum("bkid,bkjd->bijd", a, b)
+
+        x = self.p_out(self.norm_out(x)) * self.g_out(x_in).sigmoid()
+
+        return x
 """

@@ -181,4 +181,66 @@ class AF3TriangleAttentionEndingNode(AF3TriangleAttention):
     def __init__(self, *args, **kwargs):
         kwargs["starting"] = False
         super().__init__(*args, **kwargs)
+
+
+class AF3TriangleMultiplicationOutgoing(nn.Module):
+    def __init__(self, c_z: int, c_hidden: int):
+        super().__init__()
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.linear_a_p = nn.Linear(c_z, c_hidden)
+        self.linear_a_g = nn.Linear(c_z, c_hidden)
+        self.linear_b_p = nn.Linear(c_z, c_hidden)
+        self.linear_b_g = nn.Linear(c_z, c_hidden)
+        self.linear_g = nn.Linear(c_z, c_z)
+        self.linear_z = nn.Linear(c_hidden, c_z)
+        self.layer_norm_in = nn.LayerNorm(c_z)
+        self.layer_norm_out = nn.LayerNorm(c_hidden)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        z = self.layer_norm_in(z)
+        mask = mask.unsqueeze(-1)
+        a = mask * self.sigmoid(self.linear_a_g(z)) * self.linear_a_p(z)
+        b = mask * self.sigmoid(self.linear_b_g(z)) * self.linear_b_p(z)
+        
+        # [B, Ni, Nk, H], [B, Nj, Nk, H] -> [B, Ni, Nj, H]
+        x = torch.einsum("bikd,bjkd->bijd", a, b)
+        
+        x = self.layer_norm_out(x)
+        x = self.linear_z(x)
+        g = self.sigmoid(self.linear_g(z))
+        x = x * g
+        return x
+
+
+class AF3TriangleMultiplicationIncoming(nn.Module):
+    def __init__(self, c_z: int, c_hidden: int):
+        super().__init__()
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.linear_a_p = nn.Linear(c_z, c_hidden)
+        self.linear_a_g = nn.Linear(c_z, c_hidden)
+        self.linear_b_p = nn.Linear(c_z, c_hidden)
+        self.linear_b_g = nn.Linear(c_z, c_hidden)
+        self.linear_g = nn.Linear(c_z, c_z)
+        self.linear_z = nn.Linear(c_hidden, c_z)
+        self.layer_norm_in = nn.LayerNorm(c_z)
+        self.layer_norm_out = nn.LayerNorm(c_hidden)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        z = self.layer_norm_in(z)
+        mask = mask.unsqueeze(-1)
+        a = mask * self.sigmoid(self.linear_a_g(z)) * self.linear_a_p(z)
+        b = mask * self.sigmoid(self.linear_b_g(z)) * self.linear_b_p(z)
+        
+        # [B, Nk, Ni, H], [B, Nk, Nj, H] -> [B, Ni, Nj, H]
+        x = torch.einsum("bkid,bkjd->bijd", a, b)
+        
+        x = self.layer_norm_out(x)
+        x = self.linear_z(x)
+        g = self.sigmoid(self.linear_g(z))
+        x = x * g
+        return x
 """

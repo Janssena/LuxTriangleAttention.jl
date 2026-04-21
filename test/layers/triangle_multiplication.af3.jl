@@ -1,23 +1,24 @@
-include("../python/boltz2.jl");
+include("../python/alphafold3.jl");
 
-function copy_weights_to_boltz2_triangle_multiplication!(
+function copy_weights_to_af3_triangle_multiplication!(
     py_layer::PyObject,
     ps::NamedTuple
 )   
-    sync_layernorm!(py_layer.norm_in, ps.layer_norm)
-    sync_glu!(py_layer, ps.core.glu_ab; ref=(linear=:p_in, gate=:g_in, ))
-    sync_layernorm!(py_layer.norm_out, ps.core.layer_norm_out)
-    sync_glu!(py_layer, ps.core.glu_out; ref=(linear=:p_out, gate=:g_out, ))
+    sync_layernorm!(py_layer.layer_norm_in, ps.layer_norm)
+    sync_glu!(py_layer, ps.core.glu_a; ref=(linear=:linear_a_p, gate=:linear_a_g, ))
+    sync_glu!(py_layer, ps.core.glu_b; ref=(linear=:linear_b_p, gate=:linear_b_g, ))
+    sync_layernorm!(py_layer.layer_norm_out, ps.core.layer_norm_out)
+    sync_glu!(py_layer, ps.core.glu_out; ref=(linear=:linear_z, gate=:linear_g, ))
 
     return nothing
 end
 
 rng = Random.Xoshiro(42)
 
-@testset "TriangleMultiplication Boltz2" begin
+@testset "TriangleMultiplication AF3" begin
     T = Float32
     chn_in = 64
-    chn_hidden = 64 # Boltz2 uses full width
+    chn_hidden = 32
     N = 16
     B = 2
     x = randn(T, chn_in, N, N, B)
@@ -29,16 +30,16 @@ rng = Random.Xoshiro(42)
     
     for is_outgoing in [true, false], (name, mask) in mask_cfg
         @testset "$(is_outgoing ? "Outgoing" : "Incoming"), $name" begin
-            # Boltz2 uses unfused GLU (fused_glu=false)
+            # AF3 uses non-fused core AND non-fused GLUs
             jl_layer = TriangleMultiplication(chn_in, chn_hidden; 
-                is_outgoing, use_bias=false, fused=true, fused_glu=false
+                is_outgoing, use_bias=true, fused=false, fused_glu=false
             )
             ps, st = Lux.setup(rng, jl_layer)
 
-            py_cls = is_outgoing ? py"Boltz2TriangleMultiplicationOutgoing" : py"Boltz2TriangleMultiplicationIncoming"
-            py_layer = py_cls(chn_in)
+            py_cls = is_outgoing ? py"AF3TriangleMultiplicationOutgoing" : py"AF3TriangleMultiplicationIncoming"
+            py_layer = py_cls(chn_in, chn_hidden)
 
-            copy_weights_to_boltz2_triangle_multiplication!(py_layer, ps)
+            copy_weights_to_af3_triangle_multiplication!(py_layer, ps)
             
             x_py = to_py(x; swap_batch_dim=true)
             mask_py = isnothing(mask) ? to_py(ones(T, N, N, B); swap_batch_dim=true) : to_py(permutedims(mask, (3, 1, 2)); swap_batch_dim=false).to(py_dtype(T))

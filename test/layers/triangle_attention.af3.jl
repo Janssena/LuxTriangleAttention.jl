@@ -56,7 +56,7 @@ end
     
             x_py = to_py(x; swap_batch_dim=true)
             if !isnothing(mask)
-                mask_py = to_py(permutedims(mask, (3, 1, 2)))
+                mask_py = to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T))
                 mask_py = inf_val * (mask_py - 1) # [B, N, N] 
             else
                 mask_py = nothing
@@ -100,7 +100,7 @@ end
                 py_layer.eval()
                 
                 x_py = to_py(x; swap_batch_dim=true)
-                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2)))
+                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T))
                 
                 y_jl, _ = jl_layer(x, mask, ps, st)
                 py_out = py_layer(x_py, mask_py)
