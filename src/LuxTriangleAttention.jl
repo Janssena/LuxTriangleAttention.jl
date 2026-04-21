@@ -7,7 +7,7 @@ import Lux, Random
 using Tullio, LoopVectorization, NNlib, Enzyme, Enzyme.EnzymeRules, Static, PrecompileTools
 
 include("layers/primitives.jl");
-export LayerNormNoBias
+export LayerNormNoBias, GatedLinearUnit, SwiGLU
 
 include("kernels/kernels.jl");
 export triangle_attention
@@ -18,6 +18,10 @@ export triangle_attention_gpu
 include("layers/triangle_attention.jl");
 include("layers/tri_attn_core.jl");
 export TriangleAttention, TriAttnCore
+
+include("layers/triangle_multiplication.jl");
+include("layers/tri_mul_core.jl");
+export TriangleMultiplication, TriMulCore
 
 # Precompile attention kernels
 @setup_workload begin
