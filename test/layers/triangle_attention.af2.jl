@@ -93,25 +93,27 @@ end
     
         @testset "TriangleAttention ($name)" begin
             for is_starting in [true, false]
-                jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=true, out_use_bias=true)
-                ps, st = Lux.setup(rng, jl_layer)
-    
-                py_layer = py"AF2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
+                @testset "$(is_starting ? "Starting" : "Ending")" begin 
+                    jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=true, out_use_bias=true)
+                    ps, st = Lux.setup(rng, jl_layer)
+        
+                    py_layer = py"AF2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
 
-                copy_weights_to_af2_triangle_attention!(py_layer, ps)
-                
-                x_py = to_py(x; swap_batch_dim=true)
-                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T)) # Needs to be float
-                
-                y_jl, _ = jl_layer(x, mask, ps, st)
-                py_out = py_layer(x_py, mask_py)
-    
-                @testset "Parity" begin
-                    @test y_jl ≈ to_jl(py_out; swap_batch_dim=true)
-                end
-    
-                @testset "Type-stability" begin
-                    @test_nowarn @inferred jl_layer(x, mask, ps, st)
+                    copy_weights_to_af2_triangle_attention!(py_layer, ps)
+                    
+                    x_py = to_py(x; swap_batch_dim=true)
+                    mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T)) # Needs to be float
+                    
+                    y_jl, _ = jl_layer(x, mask, ps, st)
+                    py_out = py_layer(x_py, mask_py)
+        
+                    @testset "Parity" begin
+                        @test y_jl ≈ to_jl(py_out; swap_batch_dim=true)
+                    end
+        
+                    @testset "Type-stability" begin
+                        @test_nowarn @inferred jl_layer(x, mask, ps, st)
+                    end
                 end
             end
         end

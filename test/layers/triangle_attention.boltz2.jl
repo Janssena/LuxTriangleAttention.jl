@@ -92,25 +92,27 @@ end
     
         @testset "Boltz2 TriangleAttention ($name)" begin
             for is_starting in [true, false]
-                jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=false, out_use_bias=false)
-                ps, st = Lux.setup(rng, jl_layer)
-    
-                py_layer = py"Boltz2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
-                copy_weights_to_boltz2_triangle_attention!(py_layer, ps)
-                py_layer.eval()
-                
-                x_py = to_py(x; swap_batch_dim=true)
-                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T))
-                
-                y_jl, _ = jl_layer(x, mask, ps, st)
-                py_out = py_layer(x_py, mask_py; use_kernels=false)
-    
-                @testset "Parity" begin
-                    @test y_jl ≈ to_jl(py_out; swap_batch_dim=true)
-                end
+                @testset "$(is_starting ? "Starting" : "Ending")" begin 
+                    jl_layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias=false, inf=inf_val, qkv_use_bias=false, gate_use_bias=false, out_use_bias=false)
+                    ps, st = Lux.setup(rng, jl_layer)
+        
+                    py_layer = py"Boltz2TriangleAttention"(chn_in, chn_hidden, num_heads, starting=is_starting, inf=inf_val)
+                    copy_weights_to_boltz2_triangle_attention!(py_layer, ps)
+                    py_layer.eval()
+                    
+                    x_py = to_py(x; swap_batch_dim=true)
+                    mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T))
+                    
+                    y_jl, _ = jl_layer(x, mask, ps, st)
+                    py_out = py_layer(x_py, mask_py; use_kernels=false)
+        
+                    @testset "Parity" begin
+                        @test y_jl ≈ to_jl(py_out; swap_batch_dim=true)
+                    end
 
-                @testset "Type-stability" begin
-                    @test_nowarn @inferred jl_layer(x, mask, ps, st)
+                    @testset "Type-stability" begin
+                        @test_nowarn @inferred jl_layer(x, mask, ps, st)
+                    end
                 end
             end
         end

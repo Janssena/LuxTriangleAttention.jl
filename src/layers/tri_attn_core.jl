@@ -1,7 +1,7 @@
 struct TriAttnCore{Q,K,V,G,O,T} <: Lux.AbstractLuxContainerLayer{(:linear_q,:linear_k,:linear_v,:gate,:linear_out)}
     linear_q::Q
     linear_k::K
-    linear_v::V 
+    linear_v::V
     gate::G
     linear_out::O
     chn_hidden::Int # D, Feature dimension per head
@@ -47,9 +47,8 @@ Lux.initialstates(rng::Random.AbstractRNG, attn::TriAttnCore) = (
 )
 
 (m::TriAttnCore)(x, bias, ps, st) = m(x, bias, nothing, ps, st)
-(m::TriAttnCore)(x, bias, mask, ps, st) = _tri_attn_core_forward(m, x, bias, mask, ps, st)
 
-function _tri_attn_core_forward(m::TriAttnCore, x, bias, mask, ps, st)
+function (m::TriAttnCore)(x, bias, mask, ps, st)
     _, N, _, B = size(x) # [C, N, N, B]
     qkv_dims = (m.chn_hidden, m.num_heads, N, N, B)
 

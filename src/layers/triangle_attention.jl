@@ -30,10 +30,7 @@ end
 )
 (m::TriangleAttention)(x::AbstractArray, ps, st) = m(x, nothing, ps, st)
 
-(m::TriangleAttention)(x::AbstractArray, mask, ps, st) = 
-    _triangle_attention_forward(m, x, mask, ps, st)
-
-function _triangle_attention_forward(m::TriangleAttention, x, mask, ps, st)
+function (m::TriangleAttention)(x::AbstractArray, mask, ps, st)
     x, mask = __tri_attn_permute_maybe(m.permute, x, mask)
     x̃, layer_norm = m.layer_norm(x, ps.layer_norm, st.layer_norm) # [C, N, N, B]
     
