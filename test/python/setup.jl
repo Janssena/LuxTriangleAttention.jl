@@ -7,6 +7,7 @@ Pkg.build("PyCall")
 using PyCall
 
 const torch = pyimport("torch")
+convert_types(::Type{Float64}) = Lux.f64
 
 py_dtype(::Type{Float64}) = torch.float64
 py_dtype(::Type{Float32}) = torch.float32
@@ -16,7 +17,7 @@ py_dtype(::Type{Int64}) = torch.int64
 py_dtype(::Type{Bool}) = torch.bool
 
 _swap_batch_dim(x::AbstractVector) = x
-_swap_batch_dim(x::AbstractArray{T, N}) where {T,N} = permutedims(x, (N, 2:N-1..., 1))
+_swap_batch_dim(x::AbstractArray{T,N}) where {T,N} = permutedims(x, (N, 2:N-1..., 1))
 
 function to_py(x::AbstractArray{T}; swap_batch_dim=false, device="cpu") where T
     x_py = swap_batch_dim ? _swap_batch_dim(x) : x
@@ -99,4 +100,71 @@ function _unfuse(jl::NamedTuple{(:linear, :gate)})
     end
 
     return ps
+end
+
+function sync_qkv!(py::PyObject, ps::NamedTuple)
+    if :weight ∈ keys(ps)
+        # Julia qkv is fully fused: [3*C_hidden*H, C_in]
+        # Python has linear_q, linear_k, linear_v
+        # Split Julia weight
+        W = ps.weight
+        C_h = size(W, 1) ÷ 3
+
+        copy_jl_ps_to_py!(py.linear_q.weight, view(W, 1:C_h, :))
+        copy_jl_ps_to_py!(py.linear_k.weight, view(W, C_h+1:2*C_h, :))
+        copy_jl_ps_to_py!(py.linear_v.weight, view(W, 2*C_h+1:3*C_h, :))
+
+        if :bias ∈ keys(ps)
+            B = ps.bias
+            copy_jl_ps_to_py!(py.linear_q.bias, view(B, 1:C_h))
+            copy_jl_ps_to_py!(py.linear_k.bias, view(B, C_h+1:2*C_h))
+            copy_jl_ps_to_py!(py.linear_v.bias, view(B, 2*C_h+1:3*C_h))
+        end
+    elseif :q in keys(ps) && :kv in keys(ps)
+        # Version where only kv is fused.
+        sync_dense!(py.linear_q, ps.q)
+        W_kv = ps.kv.weight
+        C_h = size(W_kv, 1) ÷ 3
+        copy_jl_ps_to_py!(py.linear_k.weight, view(W_kv, 1:C_h, :))
+        copy_jl_ps_to_py!(py.linear_v.weight, view(W_kv, C_h+1:2*C_h, :))
+        if :bias ∈ keys(ps.kv)
+            B = ps.kv.bias
+            copy_jl_ps_to_py!(py.linear_k.bias, view(B, 1:C_h))
+            copy_jl_ps_to_py!(py.linear_v.bias, view(B, C_h+1:2*C_h))
+        end
+    else # unfused
+        sync_dense!(py.linear_q, ps.q)
+        sync_dense!(py.linear_k, ps.k)
+        sync_dense!(py.linear_v, ps.v)
+    end
+
+    return nothing
+end
+
+function sync_attention!(py::PyObject, ps::NamedTuple)
+    sync_qkv!(py, ps.qkv)
+    sync_dense!(py.linear_o, ps.out)
+
+    if !isempty(ps.gate)
+        sync_dense!(py.linear_g, ps.gate)
+    end
+
+    return nothing
+end
+
+sync_af3_triangle_attention!(
+    args...;
+    ref=(layer_norm=:layer_norm, linear=:linear_z, mha=:mha)
+) = sync_triangle_attention!(args...; ref)
+
+function sync_triangle_attention!(
+    py::PyObject,
+    ps::NamedTuple;
+    ref=(layer_norm=:layer_norm, linear=:linear, mha=:mha)
+)
+    sync_layernorm!(py[ref.layer_norm], ps.layer_norm)
+    sync_dense!(py[ref.linear], ps.linear)
+    sync_attention!(py[ref.mha], ps.mha)
+
+    return nothing
 end
