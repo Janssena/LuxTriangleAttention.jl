@@ -68,8 +68,9 @@ Triangle Attention is a variant of axial attention that incorporates a "triangle
 - **Ending Node Attention**: Attends over the $i$-dimension.
 
 **Dimensional Conventions**:
-- Input shape: `[C, N, dims...]`.
-- Attention Dimension: This implementation performs attention over the **3rd dimension** (`token_dim=3`). This differs from some Python implementations (e.g., Boltz-1) which attend over the 4th dimension.
+- Input shape: `[C, Ni, Nj, B]`.
+- Query shape: `[D, H, Ni, Nj, B]`.
+- Attention Dimension: This implementation performs attention over the **3rd dimension** in [D, H, Ni, Nj, B] (`token_dim=3`). This differs from some Python implementations (e.g., Boltz-1) which attend over the 4th dimension.
 
 ### Triangle Multiplication
 Triangle Multiplication updates the pair representation by combining information from edges sharing a common node.
@@ -79,7 +80,7 @@ Triangle Multiplication updates the pair representation by combining information
 ## Masking and Bias
 
 ### Boolean Masking
-Optional masks of shape `[N, B]`, `[N, N, B]`, or `[N, S, B]` are automatically reshaped to fit the internal attention score format.
+Optional masks of shape `[N, B]`, `[Ni, Nj, B]`, or `[N, S, B]` are automatically reshaped to fit the internal attention score format.
 
 ```julia
 # Example: Binary mask for sequence padding [N, B]
