@@ -74,8 +74,8 @@ Triangle Attention is a variant of axial attention that incorporates a "triangle
 
 ### Triangle Multiplication
 Triangle Multiplication updates the pair representation by combining information from edges sharing a common node.
-- **Outgoing**: $\mathbf{z}_{ij} = \sum_k \mathbf{a}_{ik} \odot \mathbf{b}_{jk}$
-- **Incoming**: $\mathbf{z}_{ij} = \sum_k \mathbf{a}_{ki} \odot \mathbf{b}_{kj}$
+- **Outgoing**: $`\mathbf{z}_{ij} = \sum_k \mathbf{a}_{ik} \odot \mathbf{b}_{jk}`$
+- **Incoming**: $`\mathbf{z}_{ij} = \sum_k \mathbf{a}_{ki} \odot \mathbf{b}_{kj}`$
 
 ## Masking and Bias
 
