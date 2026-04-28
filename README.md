@@ -1,6 +1,6 @@
 # LuxTriangleAttention.jl
 
-Efficient Triangle Attention and Triangle Multiplication layers for Lux.jl, specifically designed for protein structure prediction models like AlphaFold2 and Boltz-1.
+Efficient Triangle Attention and Triangle Multiplication layers for Lux.jl, specifically designed for protein structure prediction models like AlphaFold and Boltz.
 
 ## Features
 
@@ -9,6 +9,11 @@ Efficient Triangle Attention and Triangle Multiplication layers for Lux.jl, spec
 - **Flexible Gating**: Support for gated attention and Gated Linear Units (GLU/SwiGLU).
 - **Lux Native**: Built on top of `Lux.jl` for modularity and performance.
 - **Performance Optimized**: Uses `Lux.batched_matmul` and fused kernels where possible.
+
+## Numerical Parity
+
+This package has undergone extensive numerical parity testing against reference Python implementations (AlphaFold2, AlphaFold3, and Boltz2). All layers are verified to produce consistent results with their Python counterparts across various precisions and input configurations.
+
 
 ## Installation
 
