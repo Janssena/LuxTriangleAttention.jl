@@ -4,11 +4,11 @@ Efficient Triangle Attention and Triangle Multiplication layers for Lux.jl, spec
 
 ## Features
 
-- **Triangle Attention**: Implementation of Axial Attention with Triangle Bias.
-- **Triangle Multiplication**: Implementation of Outgoing and Incoming Triangle Multiplication (Algorithms 11 & 12).
-- **Flexible Gating**: Support for gated attention and Gated Linear Units (GLU/SwiGLU).
+- **Triangle Attention**: Implementation of Starting and Ending Axial Attention with Triangle Bias (AlphaFold: Algorithms 13 & 14).
+- **Triangle Multiplication**: Implementation of Outgoing and Incoming Triangle Multiplication (AlphaFold: Algorithms 11 & 12).
 - **Lux Native**: Built on top of `Lux.jl` for modularity and performance.
-- **Performance Optimized**: Uses `Lux.batched_matmul` and fused kernels where possible.
+- **Performance Optimized**: Uses `Lux.scaled_dot_product_attention`, `Lux.batched_matmul`, and fused kernels where possible.
+- **Flexible Gating**: Support for gated attention and Gated Linear Units (GLU/SwiGLU).
 
 ## Numerical Parity
 
