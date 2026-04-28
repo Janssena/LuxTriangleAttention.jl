@@ -46,7 +46,7 @@ end
 
 function (m::TriMulCore)(x_norm, mask, ps, st)
     # [C, N, N, B] -> [H, N, N, B]
-    a, b, st_proj = __trimul_projections(m, x_norm, ps, st)
+    a, b, st_proj = _prep_ab(m, x_norm, ps, st)
     
     # Apply Mask [N, N, B]
     _apply_tri_mask!(a, b, mask)
@@ -71,7 +71,7 @@ function (m::TriMulCore)(x_norm, mask, ps, st)
     return out, merge(st_proj, (; layer_norm_out, glu_out))
 end
 
-function __trimul_projections(m::TriMulCore{True}, x::AbstractArray{T,N}, ps, st) where {T,N}
+function _prep_ab(m::TriMulCore{True}, x::AbstractArray{T,N}, ps, st) where {T,N}
     ab, st_glu = m.glu_ab(x, ps.glu_ab, st.glu_ab)
     
     H = m.chn_hidden
@@ -82,7 +82,7 @@ function __trimul_projections(m::TriMulCore{True}, x::AbstractArray{T,N}, ps, st
 end
 
 # Split projections: a and b calculated separately
-function __trimul_projections(m::TriMulCore{False}, x, ps, st)
+function _prep_ab(m::TriMulCore{False}, x, ps, st)
     a, st_a = m.glu_a(x, ps.glu_a, st.glu_a)
     b, st_b = m.glu_b(x, ps.glu_b, st.glu_b)
 
@@ -98,7 +98,7 @@ function _apply_tri_mask!(a::AbstractArray{T}, b, mask::AbstractArray{Bool}) whe
     return nothing
 end
 
-function _apply_tri_mask!(a::AbstractArray{T}, b, mask::AbstractArray{Real}) where T
+function _apply_tri_mask!(a::AbstractArray{T}, b, mask::AbstractArray{<:Real}) where T
     mask_reshaped = reshape(mask, 1, size(mask)...)
     @. a = a * mask_reshaped
     @. b = b * mask_reshaped

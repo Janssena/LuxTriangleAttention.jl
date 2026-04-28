@@ -7,7 +7,7 @@ include("../python/alphafold2.jl")
         chn_in, N, B = 64, 8, 2
         chn_hidden = 32 # == D
         num_heads = 4 # == H
-        inf_val = LuxTriangleAttention._safe_inf(T)
+        inf_val = T == Float16 ? Float16(1e4) : T(1e9)
 
         x = randn(rng, T, chn_in, N, N, B)
         bias = randn(rng, T, num_heads, N, N, B)

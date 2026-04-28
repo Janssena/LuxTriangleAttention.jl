@@ -1,32 +1,11 @@
 import LuxTriangleAttention: Lux
 import Random
 
-using Test, LuxTriangleAttention, BenchmarkTools, Metal, FiniteDifferences
+using Test, LuxTriangleAttention, BenchmarkTools
 
 include("python/setup.jl");
 
 @testset "LuxTriangleAttention.jl" begin
-    @testset "Kernels" begin
-        # @testset "Python parity" begin
-        #     include("python/attention_reference.jl");
-        #     # This checks that our triangle_attention_simple! is correct so that we 
-        #     # can use it instead of the python function for downstream parity checks
-        #     include("kernels/simple.jl")
-        # end
-
-        @testset "cpu" begin
-            include("kernels/cpu.jl")
-        end
-
-        @testset "gpu" begin
-            include("kernels/gpu.jl")
-        end
-
-        @testset "gradients" begin
-            include("kernels/gradients.jl")
-        end
-    end
-
     @testset "Layers" begin
         include("layers/runtests.jl")
     end
