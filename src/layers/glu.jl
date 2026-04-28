@@ -10,8 +10,22 @@ end
     GatedLinearUnit(in_chn => out_chn; fused=static(true), activation=Lux.sigmoid, use_bias=false)
     GatedLinearUnit((in_val, in_gate) => out_chn; ...)
 
-Implements a Gated Linear Unit: `y = linear(x_linear) .* activation(gate(x_gate))`.
-If `fused=true`, `in_val` must equal `in_gate`, and a single `Dense` call is used for both projections.
+Implements a Gated Linear Unit: `y = linear(x_linear) * activation(gate(x_gate))`.
+
+## Arguments
+- `in_out`: A `Pair` mapping input channels to output channels. Can also be `(in_val, in_gate) => out_chn`.
+
+## Keyword Arguments
+- `fused`: If `true`, `in_val` must equal `in_gate`, and a single `Dense` call is used for both projections.
+- `activation`: Activation function to apply to the gate branch.
+- `use_bias`: Whether to use bias in the linear projections.
+
+## Inputs
+- `x`: Input tensor with shape `[C, N, ...]` or a `Tuple` of tensors for dual inputs.
+
+## Returns
+- `y`: Output tensor with shape `[out_chn, N, ...]`.
+- `st`: Updated state.
 """
 function GatedLinearUnit(
     in_out::Pair; 
@@ -36,6 +50,18 @@ end
 GatedLinearUnit(in::Union{Tuple{Int,Int}, Int}, out::Int, args...; kwargs...) = 
     GatedLinearUnit(in => out, args...; kwargs...)
 
+"""
+    SwiGLU(in_chn => out_chn; kwargs...)
+
+A variant of `GatedLinearUnit` using the `swish` activation function. 
+Commonly used in Transformer architectures (e.g., LLaMA, Boltz-1).
+
+## Arguments
+- `in_out`: Input to Output mapping.
+
+## Keyword Arguments
+- `kwargs...`: Passed to `GatedLinearUnit`.
+"""
 SwiGLU(args...; kwargs...) = GatedLinearUnit(args...; activation=Lux.swish, kwargs...)
 
 function (m::GatedLinearUnit)(x::AbstractArray, ps, st)

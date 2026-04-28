@@ -1,15 +1,33 @@
+"""
+    TriangleMultiplication(chn_in, hidden_chn; is_outgoing=true, kwargs...)
+
+Implementation of Triangle Multiplication (Algorithm 11 & 12 from AlphaFold2).
+Updates the pair representation by combining edges sharing a common node.
+
+## Arguments
+- `chn_in`: Input channels.
+- `chn_hidden`: Hidden channels for internal projections.
+
+## Keyword Arguments
+- `is_outgoing`: If `true`, performs "Outgoing" multiplication (Algorithm 11). 
+  If `false`, performs "Incoming" multiplication (Algorithm 12).
+- `layernorm_eps`: Epsilon for LayerNorm.
+- `kwargs...`: Passed to `TriMulCore`.
+
+## Inputs
+- `x`: Input tensor with shape `[C, N, N, B]`.
+- `mask`: Optional mask with shape `[N, N, B]`.
+
+## Returns
+- `y`: Output tensor with shape `[C, N, N, B]`.
+- `st`: Updated state.
+"""
 struct TriangleMultiplication{LN, CORE} <: Lux.AbstractLuxContainerLayer{(:layer_norm, :core)}
     layer_norm::LN
     core::CORE
 end
 
-"""
-    TriangleMultiplication(chn_in::Int, hidden_chn::Int; is_outgoing=true, layernorm_eps=1f-5, kwargs...)
 
-Takes x ~ [C, N, N, B] and returns y ~ [C, N, N, B].
-If `is_outgoing=true`, performs Outgoing multiplication (Algorithm 11).
-If `is_outgoing=false`, performs Incoming multiplication (Algorithm 12).
-"""
 function TriangleMultiplication(
     chn_in::Int, chn_hidden::Int;
     is_outgoing::Union{Bool, StaticBool}=static(true),

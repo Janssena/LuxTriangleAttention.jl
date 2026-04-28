@@ -1,3 +1,27 @@
+"""
+    TriMulCore(chn_in, chn_hidden; is_outgoing=true, fused=true, kwargs...)
+
+Core logic for Triangle Multiplication. Handles projections, masking, and 
+batched matrix multiplication for edge updates.
+
+## Arguments
+- `chn_in`: Input channels.
+- `chn_hidden`: Hidden channels.
+
+## Keyword Arguments
+- `is_outgoing`: If `true`, performs "Outgoing" multiplication.
+- `fused`: If `true`, fuses the A & B projections into a single GLU operation.
+- `fused_glu`: If `true`, uses fused GLU layers.
+- `use_bias`: Boolean for internal layer biases.
+
+## Inputs
+- `x`: Input tensor with shape `[C, N, N, B]`.
+- `mask`: Optional mask with shape `[N, N, B]`.
+
+## Returns
+- `y`: Output tensor with shape `[chn_hidden, N, N, B]`.
+- `st`: Updated state.
+"""
 struct TriMulCore{F<:StaticBool, DIR<:StaticBool, GAB, GA, GB, LNO, GOUT} <: Lux.AbstractLuxContainerLayer{(:glu_ab, :glu_a, :glu_b, :layer_norm_out, :glu_out)}
     fused::F
     is_outgoing::DIR
@@ -71,6 +95,20 @@ function (m::TriMulCore)(x_norm, mask, ps, st)
     return out, merge(st_proj, (; layer_norm_out, glu_out))
 end
 
+"""
+    _prep_ab(m::TriMulCore, x, ps, st)
+
+Helper to project the input into the `A` and `B` representations for multiplication.
+If `fused=true`, uses a single projection followed by split.
+
+## Arguments
+- `m`: `TriMulCore` layer.
+- `x`: Input tensor.
+
+## Returns
+- `(a, b)`: Projected representations.
+- `st`: Updated state.
+"""
 function _prep_ab(m::TriMulCore{True}, x::AbstractArray{T,N}, ps, st) where {T,N}
     ab, st_glu = m.glu_ab(x, ps.glu_ab, st.glu_ab)
     
@@ -90,6 +128,15 @@ function _prep_ab(m::TriMulCore{False}, x, ps, st)
 end
 
 
+"""
+    _apply_tri_mask!(a, b, mask)
+
+Applies the triangle mask to the projected `A` and `B` representations.
+
+## Arguments
+- `a`, `b`: Projected representations.
+- `mask`: Input mask.
+"""
 _apply_tri_mask!(a, b, mask::Nothing) = nothing
 function _apply_tri_mask!(a::AbstractArray{T}, b, mask::AbstractArray{Bool}) where T
     mask_reshaped = reshape(mask, 1, size(mask)...)

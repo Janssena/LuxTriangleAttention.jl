@@ -5,31 +5,53 @@
 
 Multi-head attention layer. Supports self-attention, cross-attention, and gated attention.
 
-# Arguments
+## Arguments
 - `chn_q`: Channels for the query input.
 - `chn_k`: Channels for the key input.
 - `chn_v`: Channels for the value input.
 - `head_dim`: Dimension of each attention head.
 - `num_heads`: Number of attention heads.
 
-# Keyword Arguments
+## Keyword Arguments
 - `use_bias`: A `NamedTuple` or `Bool` specifying which internal layers should use bias. 
   Defaults to `false`.
 - `fuse_qkv`: If `true`, fuses the Q, K, and V projections into a single dense layer 
   (where possible).
 - `use_gate`: If `true` (or `static(true)`), applies a sigmoid gating to the attention output.
 
-# Inputs
+## Inputs
 - `x`: Input tensor(s). Can be an `AbstractArray` for self-attention, or a `Tuple` of 
-  arrays for cross-attention (e.g., `(q, kv)` or `(q, k, v)`).
-- `bias`: Optional attention bias tensor. Expected shape: `[num_heads, Nq, Nk, (S, ) B]`.
-- `mask`: Optional attention mask. Expected shape: `[Nq, (S, ) B]`.
+  arrays for cross-attention (e.g., `(q, kv)` or `(q, k, v)`). 
+  Expected shape: `[C, N, (N or S, ) B]`.
+- `bias`: Optional attention bias tensor. Expected shape: `[num_heads, Nq, Nk, B]`.
+  Must have the correct shape for broadcasting. See `prep_triangle_bias`.
+- `mask`: Optional attention mask. Expected shape: `[Nq, (S, ) B]` or `[Ni, Nj, B]`.
+  Masks are automatically reshaped to the internal 4D/5D attention score format.
 
-# Returns
-- `(y, scores)`:
-  - `y`: The output tensor. Shape matches `q` (typically `[chn_q, Nq, (S, ) B]`).
-  - `scores`: The attention scores. Shape: `[num_heads, Nq, Nk, (S, ) B]`.
+## Returns
+- `y`: The output tensor. Shape matches `q` (typically `[chn_q, N, (N or S, ) B]`).
 - `st`: Updated state.
+
+## Example
+```julia
+using Lux, LuxTriangleAttention, Random
+
+# Self-attention with mask
+model = Attention(64, 32, 4)
+ps, st = Lux.setup(Random.default_rng(), model)
+
+x = randn(Float32, 64, 32, 1)
+mask = rand(Bool, 32, 1)
+
+# Pass inputs as a NamedTuple
+y, st = model((; x, mask), ps, st)
+```
+
+## Note on Dimensions
+This implementation performs attention over the 3rd dimension (`token_dim=3`).
+This is different from most Python references (e.g., Boltz-2, AlphaFold2 and 3) which 
+typically attend over the 4th dimension. This is automatically resolved in the 
+TriangleAttention layer to match python output.
 """
 struct Attention{SG,QKV,G,O} <: Lux.AbstractLuxContainerLayer{(:qkv, :gate, :out)}
     should_gate::SG
@@ -181,6 +203,20 @@ function _prep_qkv(qkv::Lux.BranchLayer, x::Tuple, ps, st; head_dim, num_heads)
     return (q, k, v), (q=st_q, k=st_k, v=st_v)
 end
 
+"""
+    prep_mask(mask)
+
+Utility to reshape various mask shapes into the internal 4D/5D format expected by 
+`Lux.scaled_dot_product_attention`.
+
+## Arguments
+- `mask`: Input mask.
+
+## Returns
+Supported conversions:
+- `[N, B]` -> `[N, 1, 1, B]`
+- `[Ni, Nj, B]` -> `[Ni, 1, 1, Nj, B]`
+"""
 prep_mask(::Nothing) = nothing
 function prep_mask(mask::AbstractArray{T,2}) where T
     N, B = size(mask)
