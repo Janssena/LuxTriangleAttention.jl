@@ -1,4 +1,4 @@
-import LuxTriangleAttention: Lux
+import LuxTriangleAttention: Lux, Static.static
 import Random
 
 using Test, LuxTriangleAttention, BenchmarkTools

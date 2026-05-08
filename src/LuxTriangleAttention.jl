@@ -15,7 +15,7 @@ export GatedLinearUnit, SwiGLU
 
 include("layers/attention.jl")
 include("layers/triangle_attention.jl")
-export Attention, TriangleAttention, prep_mask, prep_triangle_bias
+export Attention, TriangleAttention, prep_mask, prep_bias
 
 include("layers/triangle_multiplication.jl")
 include("layers/tri_mul_core.jl")

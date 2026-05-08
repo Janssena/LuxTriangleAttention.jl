@@ -1,5 +1,5 @@
 """
-    Attention(chn_q, chn_k, chn_v, head_dim, num_heads; use_bias=false, fuse_qkv=true, use_gate=static(true))
+    Attention(chn_q, chn_k, chn_v, head_dim, num_heads; use_bias=false, fuse_qkv=true, use_gate=static(true), bias_layout=:kq)
     Attention(chn_q, chn_kv, head_dim, num_heads; kwargs...)
     Attention(chn_in, head_dim, num_heads; kwargs...)
 
@@ -18,13 +18,23 @@ Multi-head attention layer. Supports self-attention, cross-attention, and gated 
 - `fuse_qkv`: If `true`, fuses the Q, K, and V projections into a single dense layer 
   (where possible).
 - `use_gate`: If `true` (or `static(true)`), applies a sigmoid gating to the attention output.
+- `bias_layout`: A `Symbol` (either `:qk` or `:kq`) indicating how the attention bias tensor 
+  should be prepared internally. Defaults to `:kq`.
+  - `:qk`: Used in `TriangleAttention`. Expects a bias of shape `[H, Ni, Nj, B]`, which is 
+    permuted to `[Ni, Nj, H, 1, B]` to match the Julia Lux 3rd-dimension attention default. 
+    Since the input is also permuted in `TriangleAttention`, no additional transpose of the 
+    bias is required.
+  - `:kq`: Used in pair-bias implementations (e.g., MSA or general pair representations). 
+    Expects a bias of shape `[H, Nq, Nk, B]`, which is permuted/transposed to `[Nk, Nq, H, 1, B]` 
+    to correct for the difference between Julia Lux's 3rd-dimension attention and Python's 
+    4th-dimension attention when working with inputs of shape `[C, N, S, B]` (vs Python's `[B, S, N, C]`).
 
 ## Inputs
 - `x`: Input tensor(s). Can be an `AbstractArray` for self-attention, or a `Tuple` of 
   arrays for cross-attention (e.g., `(q, kv)` or `(q, k, v)`). 
   Expected shape: `[C, N, (N or S, ) B]`.
 - `bias`: Optional attention bias tensor. Expected shape: `[num_heads, Nq, Nk, B]`.
-  Must have the correct shape for broadcasting. See `prep_triangle_bias`.
+  Must have the correct shape for broadcasting. See `prep_bias`.
 - `mask`: Optional attention mask. Expected shape: `[Nq, (S, ) B]` or `[Ni, Nj, B]`.
   Masks are automatically reshaped to the internal 4D/5D attention score format.
 
@@ -50,16 +60,21 @@ y, st = model((; x, mask), ps, st)
 ## Note on Dimensions
 This implementation performs attention over the 3rd dimension (`token_dim=3`).
 This is different from most Python references (e.g., Boltz-2, AlphaFold2 and 3) which 
-typically attend over the 4th dimension. This is automatically resolved in the 
-TriangleAttention layer to match python output.
+typically attend over the 4th dimension.
+
+- **TriangleAttention (`bias_layout=:qk`)**:
+  In `TriangleAttention`, we pass a bias of shape `[H, Ni, Nj, B]` which is permuted internally to enable the model to attend to the 3rd dimension in `q, k, v` (representing `Nj`). The input is of size `[C, Ni, Nj, B]`. Permuting the input also permutes the resulting bias correctly, meaning no additional changes to the bias orientation are needed.
+- **AttentionPairBias (`bias_layout=:kq`)**:
+  For generic pair bias attention, the input is of shape `[C, N, S, B]` (where `S` is the pair/MSA dimension), and we attend over the `N` dimension. In Python, the equivalent shape is `[B, S, N, C]`. While the Julia input layout works naturally with Lux's 3rd-dimension attention default, the bias tensor of shape `[H, Nq, Nk, B]` must be permuted to `[Nk, Nq, H, 1, B]` to correct for the transposition. This is handled by the `:kq` layout.
 """
-struct Attention{SG,QKV,G,O} <: Lux.AbstractLuxContainerLayer{(:qkv, :gate, :out)}
+struct Attention{SG,QKV,G,O,BIAS} <: Lux.AbstractLuxContainerLayer{(:qkv, :gate, :out)}
     should_gate::SG
     qkv::QKV
     gate::G
     out::O
     head_dim::Int
     num_heads::Int # H
+    bias_layout::BIAS
 end
 
 Attention(chn_in::Int, head_dim::Int, num_heads::Int; kwargs...) =
@@ -76,8 +91,10 @@ Note: the forward function expects bias to be in the correct shape!!
 """
 function Attention(
     chn_q::Int, chn_k::Int, chn_v::Int, head_dim::Int, num_heads::Int;
-    use_bias=false, fuse_qkv::Bool=true, use_gate=static(true)
+    use_bias=false, fuse_qkv::Bool=true, use_gate=static(true), bias_layout::Symbol=:kq
 )
+    @assert bias_layout == :qk || bias_layout == :kq "`bias_layout` must be :qk or :kq."
+
     use_bias = resolve_defaults(use_bias, (:qkv, :q, :kv, :k, :v, :gate, :out))
     use_gate_static = static(use_gate)
 
@@ -117,7 +134,8 @@ function Attention(
         gate,
         out,
         head_dim,
-        num_heads
+        num_heads,
+        static(bias_layout)
     )
 end
 
@@ -139,8 +157,9 @@ end
 # x is either [C, N, B], [C, N, N, B] or [C, N, S, B]
 function (l::Attention)(x, bias, mask, ps, st)
     (q, k, v), st_qkv = _prep_qkv(l.qkv, x, ps.qkv, st.qkv; head_dim=l.head_dim, num_heads=l.num_heads)
-    
-    mask = prep_mask(mask) # We cannot reliably do the same for the bias
+
+    mask = prep_mask(mask)
+    bias = prep_bias(bias, x, l.bias_layout)
 
     attn, _ = Lux.scaled_dot_product_attention(
         q, k, v;
@@ -229,6 +248,51 @@ function prep_mask(mask::AbstractArray{T,3}) where T
 end
 
 prep_mask(mask::AbstractArray{T,5}) where T = mask # return as-is
+
+
+"""
+    prep_bias(bias, x, bias_layout)
+
+Utility to prepare and reshape the attention bias tensor based on the input shape and the specified `bias_layout`.
+
+## Arguments
+- `bias`: The raw bias tensor (or `nothing`).
+- `x`: The input tensor to the attention layer.
+- `bias_layout`: A `StaticSymbol` specifying the permutation strategy (`:qk` or `:kq`).
+
+## Permutation Strategies
+- `:qk` (Symmetric/Triangle Attention):
+  For an input of shape `[C, Ni, Nj, B]` and bias of shape `[H, Ni, Nj, B]`, permutes the bias to `[Ni, Nj, H, 1, B]` (preserving the spatial dimensions `Ni` and `Nj`).
+- `:kq` (Asymmetric/Pair Attention):
+  For an input of shape `[C, N, S, B]` and bias of shape `[H, Nq, Nk, B]`, permutes the bias to `[Nk, Nq, H, 1, B]` (transposing spatial dimensions to correct for Julia's 3rd-dimension attention vs Python's 4th-dimension attention).
+
+## Notes on Dimensions
+Python packages (such as AlphaFold and Boltz) typically perform attention over the 4th dimension (using `[B, S, N, C]`).
+Julia's `Lux` default is to attend over the 3rd dimension (`[C, N, S, B]`).
+The `bias_layout` determines how the bias tensor is adjusted to maintain parity with the Python attention mechanisms under these different dimension conventions.
+"""
+prep_bias(::Nothing, args...) = nothing
+
+# As in AttentionPairBias:
+function prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,4}, ::StaticSymbol{:kq}) where T
+    H, Nq, Nk, B = size(bias)
+    return reshape(permutedims(bias, (3, 2, 1, 4)), Nk, Nq, H, 1, B)
+end
+
+# As in TriangleAttention:
+function prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,4}, ::StaticSymbol{:qk}) where T
+    H, Ni, Nj, B = size(bias)
+    return reshape(permutedims(bias, (2, 3, 1, 4)), Ni, Nj, H, 1, B)
+end
+
+# User already put the bias in the correct shapes, return as-is
+prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,3}, ::StaticSymbol{:kq}) where T =
+    permutedims(bias, (3, 2, 1, 4)) # -> [Nj, Ni, H, B]
+
+prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,3}, ::StaticSymbol{:qk}) where T =
+    permutedims(bias, (2, 3, 1, 4)) # -> [Ni, Nj, H, B]
+
+prep_bias(bias::AbstractArray{T,5}, ::AbstractArray{T,4}, ::StaticSymbol) where T = bias
 
 _gate_maybe(::Lux.NoOpLayer, x, g, ps, st) = x, st
 

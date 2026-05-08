@@ -60,7 +60,8 @@ function TriangleAttention(
         LayerNormNoBias(shape; dims=1, epsilon=layernorm_eps)
     end
     linear = Lux.Dense(chn_in, num_heads; use_bias=use_bias.linear)
-    mha = Attention(chn_in, head_dim, num_heads; use_bias=use_bias.mha, kwargs...)
+    
+    mha = Attention(chn_in, head_dim, num_heads; use_bias=use_bias.mha, bias_layout=:qk, kwargs...)
 
     return TriangleAttention(
         static(is_starting), # starting: attend over Nj, ending: attend over Ni
