@@ -97,7 +97,7 @@ y, st = model((; x, mask=mask_ij), ps, st)
 For custom attention biases, the `prep_bias` utility shapes the bias tensor based on the specified `bias_layout`. The `bias_layout` parameter of the `Attention` layer determines how the bias is prepared internally.
 
 - **Symmetric/Triangle Layout (`bias_layout=:qk`)**:
-  Used in `TriangleAttention` where inputs are `[C, Ni, Nj, B]` and bias is `[H, Ni, Nj, B]`. It permutes the bias to `[Ni, Nj, H, 1, B]` (keeping the spatial dimensions `Ni` and `Nj` in order). You can also use the shorthand `prep_triangle_bias(raw_bias)`.
+  Used in `TriangleAttention` where inputs are `[C, Ni, Nj, B]` and bias is `[H, Ni, Nj, B]`. It permutes the bias to `[Ni, Nj, H, 1, B]` (keeping the spatial dimensions `Ni` and `Nj` in order).
 - **Asymmetric/Pair Layout (`bias_layout=:kq`)**:
   Used in `AttentionPairBias` or other pair-bias scenarios where inputs are `[C, N, S, B]` and bias is `[H, Nq, Nk, B]`. It permutes/transposes the bias to `[Nk, Nq, H, 1, B]` to correct for transposition under Lux's 3rd-dimension attention default.
 
