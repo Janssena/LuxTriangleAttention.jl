@@ -92,15 +92,23 @@ mask_ij = rand(Bool, 32, 32, 1)
 y, st = model((; x, mask=mask_ij), ps, st)
 ```
 
-### Triangle Bias
-If using custom attention bias, it must be provided in the correct shape. The `prep_triangle_bias` helper is available to shape bias tensors correctly.
+### Attention Bias and Layouts (`prep_bias`)
+
+For custom attention biases, the `prep_bias` utility shapes the bias tensor based on the specified `bias_layout`. The `bias_layout` parameter of the `Attention` layer determines how the bias is prepared internally.
+
+- **Symmetric/Triangle Layout (`bias_layout=:qk`)**:
+  Used in `TriangleAttention` where inputs are `[C, Ni, Nj, B]` and bias is `[H, Ni, Nj, B]`. It permutes the bias to `[Ni, Nj, H, 1, B]` (keeping the spatial dimensions `Ni` and `Nj` in order). You can also use the shorthand `prep_triangle_bias(raw_bias)`.
+- **Asymmetric/Pair Layout (`bias_layout=:kq`)**:
+  Used in `AttentionPairBias` or other pair-bias scenarios where inputs are `[C, N, S, B]` and bias is `[H, Nq, Nk, B]`. It permutes/transposes the bias to `[Nk, Nq, H, 1, B]` to correct for transposition under Lux's 3rd-dimension attention default.
 
 ```julia
 # 1. Generate raw bias [Heads, Ni, Nj, Batch]
+x = randn(16, 32, 32, 1)
 raw_bias = randn(Float32, 4, 32, 32, 1)
 
-# 2. Shape for internal Attention mechanism [Ni, Nj, Heads, 1, Batch]
-bias = prep_triangle_bias(raw_bias)
+# 2. Shape for internal Attention mechanism
+bias = prep_bias(raw_bias, x, :qk) # [Ni, Nj, Heads, 1, Batch]
+bias = prep_bias(raw_bias, x, :kq) # [Nj, Ni, Heads, 1, Batch]
 
 # 3. Pass to model via NamedTuple
 y, st = model((; x, bias), ps, st)

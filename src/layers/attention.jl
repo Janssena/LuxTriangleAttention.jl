@@ -281,8 +281,8 @@ end
 
 # As in TriangleAttention:
 function prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,4}, ::StaticSymbol{:qk}) where T
-    H, Ni, Nj, B = size(bias)
-    return reshape(permutedims(bias, (2, 3, 1, 4)), Ni, Nj, H, 1, B)
+    H, Nq, Nk, B = size(bias)
+    return reshape(permutedims(bias, (2, 3, 1, 4)), Nq, Nk, H, 1, B)
 end
 
 # User already put the bias in the correct shapes, return as-is
