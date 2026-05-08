@@ -70,7 +70,7 @@ Triangle Attention is a variant of axial attention that incorporates a "triangle
 **Dimensional Conventions**:
 - Input shape: `[C, Ni, Nj, B]`.
 - Query shape: `[D, H, Ni, Nj, B]`.
-- Attention Dimension: This implementation performs attention over the **3rd dimension** in [D, H, Ni, Nj, B] (`token_dim=3`). This differs from some Python implementations (e.g., Boltz-1) which attend over the 4th dimension.
+- Attention Dimension: This implementation performs attention over the **3rd dimension** in [D, H, Ni, Nj, B] (`token_dim=3`). This differs from some Python implementations (e.g., AlphaFold and Boltz) which attend over the 4th dimension.
 
 ### Triangle Multiplication
 Triangle Multiplication updates the pair representation by combining information from edges sharing a common node.
@@ -102,15 +102,15 @@ For custom attention biases, the `prep_bias` utility shapes the bias tensor base
   Used in `AttentionPairBias` or other pair-bias scenarios where inputs are `[C, N, S, B]` and bias is `[H, Nq, Nk, B]`. It permutes/transposes the bias to `[Nk, Nq, H, 1, B]` to correct for transposition under Lux's 3rd-dimension attention default.
 
 ```julia
-# 1. Generate raw bias [Heads, Ni, Nj, Batch]
-x = randn(16, 32, 32, 1)
-raw_bias = randn(Float32, 4, 32, 32, 1)
+# Generate bias [Heads, Ni, Nj, Batch]
+x = randn(16, 32, 32, 1) 
+bias = randn(Float32, 4, 32, 32, 1)
 
-# 2. Shape for internal Attention mechanism
-bias = prep_bias(raw_bias, x, :qk) # [Ni, Nj, Heads, 1, Batch]
-bias = prep_bias(raw_bias, x, :kq) # [Nj, Ni, Heads, 1, Batch]
+# Shape for internal Attention mechanism
+bias = prep_bias(bias, x, :qk) # [Ni, Nj, Heads, 1, Batch]
+bias = prep_bias(bias, x, :kq) # [Nj, Ni, Heads, 1, Batch]
 
-# 3. Pass to model via NamedTuple
+# Optionally pass to Attention layer via NamedTuple (prep_bias is also called internally)
 y, st = model((; x, bias), ps, st)
 ```
 
