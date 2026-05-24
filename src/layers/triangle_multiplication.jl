@@ -30,12 +30,12 @@ end
 
 function TriangleMultiplication(
     chn_in::Int, chn_hidden::Int;
-    is_outgoing::Union{Bool, StaticBool}=static(true),
+    is_outgoing::Union{Bool, StaticBool}=static(true), rank=4,
     layernorm_eps=1f-5, kwargs...
 )
     return TriangleMultiplication(
-        Lux.LayerNorm((chn_in, 1, 1); dims=1, epsilon=layernorm_eps),
-        TriMulCore(chn_in, chn_hidden; is_outgoing, layernorm_eps, kwargs...)
+        Lux.LayerNorm((chn_in, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps),
+        TriMulCore(chn_in, chn_hidden; is_outgoing, layernorm_eps, rank, kwargs...)
     )
 end
 

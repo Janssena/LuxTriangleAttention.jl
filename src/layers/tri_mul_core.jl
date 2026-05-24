@@ -38,7 +38,7 @@ function TriMulCore(
     is_outgoing::Union{Bool, StaticBool}=static(true),
     fused::Union{<:StaticBool,Bool}=static(true), 
     fused_glu::Union{<:StaticBool,Bool}=static(true),
-    layernorm_eps=1f-5, use_bias=false, kwargs...
+    layernorm_eps=1f-5, use_bias=false, rank=4, kwargs...
 )   
     fused_static = static(fused)
     
@@ -53,7 +53,7 @@ function TriMulCore(
         glu_b = GatedLinearUnit(chn_in => chn_hidden; fused=fused_glu, use_bias)
     end
 
-    layer_norm_out = Lux.LayerNorm((chn_hidden, 1, 1); dims=1, epsilon=layernorm_eps)
+    layer_norm_out = Lux.LayerNorm((chn_hidden, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps)
     
     # Output Gate: Dual input (chn_hidden from Y, chn_in from X)
     glu_out = GatedLinearUnit((chn_hidden, chn_in) => chn_in; fused=false, use_bias)
