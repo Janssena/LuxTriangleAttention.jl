@@ -12,6 +12,7 @@ Updates the pair representation by combining edges sharing a common node.
 - `is_outgoing`: If `true`, performs "Outgoing" multiplication (Algorithm 11). 
   If `false`, performs "Incoming" multiplication (Algorithm 12).
 - `layernorm_eps`: Epsilon for LayerNorm.
+- `rank`: The rank (ndims) of the input.
 - `kwargs...`: Passed to `TriMulCore`.
 
 ## Inputs

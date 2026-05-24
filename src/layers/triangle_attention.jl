@@ -14,6 +14,7 @@ Updates the pair representation by performing axial attention with a triangle bi
   If `false`, performs "Ending Node" attention (Algorithm 14).
 - `use_bias`: Boolean or NamedTuple for internal layer biases.
 - `layernorm_eps`: Epsilon for LayerNorm.
+- `rank`: The rank (ndims) of the input.
 
 ## Inputs
 - `x`: Input tensor with shape `[C, Ni, Nj, B]`.

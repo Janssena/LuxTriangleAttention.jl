@@ -13,6 +13,7 @@ batched matrix multiplication for edge updates.
 - `fused`: If `true`, fuses the A & B projections into a single GLU operation.
 - `fused_glu`: If `true`, uses fused GLU layers.
 - `use_bias`: Boolean for internal layer biases.
+- `rank`: The rank (ndims) of the input.
 
 ## Inputs
 - `x`: Input tensor with shape `[C, N, N, B]`.
