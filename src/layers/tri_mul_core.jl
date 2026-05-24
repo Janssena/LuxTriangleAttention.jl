@@ -69,31 +69,39 @@ function TriMulCore(
 end
 
 function (m::TriMulCore)(x_norm, mask, ps, st)
-    # [C, N, N, B] -> [H, N, N, B]
     a, b, st_proj = _prep_ab(m, x_norm, ps, st)
     
-    # Apply Mask [N, N, B]
     _apply_tri_mask!(a, b, mask)
 
-    # 3. Batched Matmul [H, N, N, B]
-    # Outgoing (Alg 11): Σ_k A[i, k] * B[j, k] -> Contract Dim 3 (j/k)
-    # Incoming (Alg 12): Σ_k A[k, i] * B[k, j] -> Contract Dim 2 (i/k)
-    cdim = known(m.is_outgoing) ? 3 : 2
-    y_raw = Lux.batched_matmul(
-        a, b;
-        lhs_contracting_dim=cdim,
-        rhs_contracting_dim=cdim,
-        lhs_batching_dims=(1, 4),
-        rhs_batching_dims=(1, 4)
-    ) # Result is [N, N, H, B]
-    
-    y = permutedims(y_raw, (3, 1, 2, 4))
+    y = _batched_matmul(m.is_outgoing, a, b)
+    y = _permute_mult_out(y) # [N, N, H, B] -> [H, N, N, B]
 
     y_norm, layer_norm_out = m.layer_norm_out(y, ps.layer_norm_out, st.layer_norm_out)
     out, glu_out = m.glu_out((y_norm, x_norm), ps.glu_out, st.glu_out)
 
     return out, merge(st_proj, (; layer_norm_out, glu_out))
 end
+
+# Outgoing (Alg 11): Σ_k A[i, k] * B[j, k] -> Contract Dim 3 (j/k)
+_batched_matmul(::True, a, b) = Lux.batched_matmul(
+    a, b;
+    lhs_contracting_dim=3,
+    rhs_contracting_dim=3,
+    lhs_batching_dims=(1, 4),
+    rhs_batching_dims=(1, 4)
+)
+
+# Incoming (Alg 12): Σ_k A[k, i] * B[k, j] -> Contract Dim 2 (i/k)
+_batched_matmul(::False, a, b) = Lux.batched_matmul(
+    a, b;
+    lhs_contracting_dim=2,
+    rhs_contracting_dim=2,
+    lhs_batching_dims=(1, 4),
+    rhs_batching_dims=(1, 4)
+)
+
+_permute_mult_out(y::AbstractArray{T,4}) where T = 
+    permutedims(y, (3, 1, 2, 4)) # permute [N, N, H, B] to [H, N, N, B]
 
 """
     _prep_ab(m::TriMulCore, x, ps, st)

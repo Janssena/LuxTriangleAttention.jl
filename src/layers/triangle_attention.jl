@@ -50,10 +50,10 @@ end
 
 function TriangleAttention(
     chn_in::Int, head_dim::Int, num_heads::Int;
-    is_starting::Union{Bool,StaticBool}=static(true), use_bias=true, layernorm_eps=1f-5, kwargs...
+    is_starting::Union{Bool,StaticBool}=static(true), rank::Int=4, use_bias=true, layernorm_eps=1f-5, kwargs...
 )
     use_bias = resolve_defaults(use_bias, (:layer_norm, :linear, :mha))
-    shape = (chn_in, 1, 1)
+    shape = (chn_in, ntuple(one, rank-2)...)
     layer_norm = if use_bias.layer_norm
         Lux.LayerNorm(shape; dims=1, epsilon=layernorm_eps)
     else
@@ -127,6 +127,5 @@ of the input tensor.
 - Tensor with swapped `i` and `j` dimensions.
 """
 ending_permute(::Nothing) = nothing
-ending_permute(q::AbstractArray{T,5}) where T = permutedims(q, (1, 2, 4, 3, 5)) # swap i and j in [D, H, N, N, B]
-ending_permute(x::AbstractArray{T,4}) where T = permutedims(x, (1, 3, 2, 4)) # swap i and j in [C, N, N, B]
-ending_permute(mask::AbstractArray{T,3}) where T = permutedims(mask, (2, 1, 3)) # swap i and j in [N, N, B]
+ending_permute(x::AbstractArray{<:Real,4}) = permutedims(x, (1, 3, 2, 4)) # swap i and j in [C, N, N, B]
+ending_permute(mask::AbstractArray{Bool,3}) = permutedims(mask, (2, 1, 3)) # swap i and j in [N, N, B]

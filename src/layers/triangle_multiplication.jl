@@ -51,13 +51,3 @@ function (m::TriangleMultiplication)(x::AbstractArray, mask, ps, st)
     out, core = m.core(x̃, mask, ps.core, st.core)
     return out, merge(st, (; layer_norm, core))
 end
-
-__trimul_permute_maybe(::False, x) = x
-__trimul_permute_maybe(::False, args::Vararg) = args
-
-__trimul_permute_maybe(::True, x) = __ingoing_permute(x)
-__trimul_permute_maybe(::True, args::Vararg) = map(__ingoing_permute, args)
-
-__ingoing_permute(::Nothing) = nothing
-__ingoing_permute(x::AbstractArray{T,3}) where T = permutedims(x, (2, 1, 3))
-__ingoing_permute(x::AbstractArray{T,4}) where T = permutedims(x, (1, 3, 2, 4))
