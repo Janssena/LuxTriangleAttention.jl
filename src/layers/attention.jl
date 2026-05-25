@@ -294,7 +294,8 @@ prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,3}, ::StaticSymbol{:qk}) w
 
 prep_bias(bias::AbstractArray{T,5}, ::AbstractArray{T,4}, ::StaticSymbol) where T = bias
 
-_gate_maybe(::Lux.NoOpLayer, x::AbstractArray, g::Union{<:Tuple,<:AbstractArray}, ps, st) = x, st
+_gate_maybe(::Lux.NoOpLayer, x::AbstractArray, g::Tuple, ps, st) = x, st
+_gate_maybe(::Lux.NoOpLayer, x::AbstractArray, g::AbstractArray, ps, st) = x, st
 
 _gate_maybe(l::Lux.AbstractLuxLayer, x::AbstractArray, g::Tuple, ps, st) =
     _gate_maybe(l, x, first(g), ps, st) # take the first element of g (i.e. q) for gating.
