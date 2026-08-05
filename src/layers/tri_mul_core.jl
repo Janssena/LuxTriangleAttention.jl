@@ -146,14 +146,13 @@ Applies the triangle mask to the projected `A` and `B` representations.
 - `a`, `b`: Projected representations.
 - `mask`: Input mask.
 """
-_apply_tri_mask!(a, b, mask::Nothing) = nothing
+_apply_tri_mask!(a, b, ::Nothing) = nothing
 function _apply_tri_mask!(a::AbstractArray{T}, b, mask::AbstractArray{Bool}) where T
     mask_reshaped = reshape(mask, 1, size(mask)...)
     @. a = ifelse(mask_reshaped, a, zero(T))
     @. b = ifelse(mask_reshaped, b, zero(T))
     return nothing
 end
-
 function _apply_tri_mask!(a::AbstractArray{T}, b, mask::AbstractArray{<:Real}) where T
     mask_reshaped = reshape(mask, 1, size(mask)...)
     @. a = a * mask_reshaped

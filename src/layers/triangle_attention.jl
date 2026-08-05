@@ -128,5 +128,5 @@ of the input tensor.
 - Tensor with swapped `i` and `j` dimensions.
 """
 ending_permute(::Nothing) = nothing
-ending_permute(x::AbstractArray{<:Real,4}) = permutedims(x, (1, 3, 2, 4)) # swap i and j in [C, N, N, B]
+ending_permute(x::AbstractArray{T,4}) where T = permutedims(x, (1, 3, 2, 4)) # swap i and j in [C, N, N, B]
 ending_permute(mask::AbstractArray{Bool,3}) = permutedims(mask, (2, 1, 3)) # swap i and j in [N, N, B]
