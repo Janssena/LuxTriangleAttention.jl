@@ -11,7 +11,7 @@ Runtime of the `Attention` layer (pair-bias, `bias_layout=:kq`) vs. the OpenFold
   <img src="docs/assets/bench_attention_alphafold3_with_mask.png" width="420" alt="Attention benchmark, with mask">
 </p>
 
-For any number of residues N, XLA-optimized julia code outperforms the PyTorch implementations on both CPU and Metal GPU by roughly 10% on CPU and roughly 2x on GPU. 
+For any number of residues N, XLA-optimized julia code outperforms the PyTorch implementations on both CPU (10-20%) and Metal GPU (roughly 2x). 
 
 System info:
 
