@@ -113,7 +113,8 @@ permute_ij_maybe(::False, x, mask) = x, mask
 
 # starting = false -> permute = true ->  swap the i and j dimensions
 permute_ij_maybe(::True, x) = ending_permute(x)
-permute_ij_maybe(::True, args::Vararg) = map(ending_permute, args)
+permute_ij_maybe(::True, x, mask) = 
+    (ending_permute(x), ending_permute(mask))
 
 """
     ending_permute(x)
