@@ -1,6 +1,6 @@
 name = "LuxTriangleAttention"
 uuid = "3d5d7496-9328-4173-860c-6da38a33fff6"
-version = "0.3.5"
+version = "0.3.6"
 authors = ["Janssena <alexanderjanssen@live.com>"]
 
 [deps]
