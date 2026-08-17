@@ -15,6 +15,8 @@ Updates the pair representation by performing axial attention with a triangle bi
 - `use_bias`: Boolean or NamedTuple for internal layer biases.
 - `layernorm_eps`: Epsilon for LayerNorm.
 - `rank`: The rank (ndims) of the input.
+- Remaining `kwargs` are forwarded to the inner [`Attention`](@ref) — notably `chunk_size`, which
+  bounds the O(N³·H) attention-score footprint by attending over slices of the batch axis.
 
 ## Inputs
 - `x`: Input tensor with shape `[C, Ni, Nj, B]`.
@@ -72,12 +74,12 @@ function TriangleAttention(
     )
 end
 
-(m::TriangleAttention)(inputs::NamedTuple, ps, st) = _triangle_attention_forward(
-    m,
-    inputs.x,
-    get(inputs, :mask, nothing),
+(m::TriangleAttention)(inputs::NamedTuple, ps, st) = m(
+    inputs.x, 
+    get(inputs, :mask, nothing), 
     ps, st
 )
+
 (m::TriangleAttention)(x::AbstractArray, ps, st) = m(x, nothing, ps, st)
 
 function (m::TriangleAttention)(x::AbstractArray, mask, ps, st)

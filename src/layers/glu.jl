@@ -64,36 +64,28 @@ Commonly used in Transformer architectures (e.g., LLaMA, Boltz-1).
 """
 SwiGLU(args...; kwargs...) = GatedLinearUnit(args...; activation=Lux.swish, kwargs...)
 
-function (m::GatedLinearUnit)(x::AbstractArray, ps, st)
-    return __glu_forward(m, x, ps, st)
-end
-
-function (m::GatedLinearUnit)(x::Tuple{<:AbstractArray, <:AbstractArray}, ps, st)
-    return __glu_forward_dual(m, x[1], x[2], ps, st)
-end
-
-function __glu_forward(m::GatedLinearUnit{True}, x::AbstractArray{T,N}, ps, st) where {T,N}
+function (m::GatedLinearUnit{True})(x::AbstractArray{T,N}, ps, st) where {T,N}
     v_and_g, linear = m.linear(x, ps.linear, st.linear)
-    v = view(v_and_g, 1:m.out_chn, ntuple(_ -> Colon(), N-1)...)
-    g = view(v_and_g, (m.out_chn+1):(2*m.out_chn), ntuple(_ -> Colon(), N-1)...)
-    y = @. v * m.activation(g)
+    dims = ntuple(Returns(Colon()), N-1)
+    v = view(v_and_g, 1:m.out_chn, dims...)
+    g = view(v_and_g, (m.out_chn+1):(2*m.out_chn), dims...)
+    y = @. v * m.activation(g) # TODO: consider in place
     return y, (; linear, )
 end
 
-function __glu_forward(m::GatedLinearUnit{False}, x, ps, st)
+(m::GatedLinearUnit{True})(::Tuple, args...) = 
+    error("Fused GatedLinearUnit does not support Tuple inputs.")
+
+function (m::GatedLinearUnit{False})(x::AbstractArray, ps, st)
     v, linear = m.linear(x, ps.linear, st.linear)
     g, gate = m.gate(x, ps.gate, st.gate)
-    y = @. v * m.activation(g)
+    y = @. v * m.activation(g) # TODO: consider in place
     return y, (; linear, gate)
 end
 
-function __glu_forward_dual(::GatedLinearUnit{True}, args...)
-    error("Fused GatedLinearUnit does not support dual inputs.")
-end
-
-function __glu_forward_dual(m::GatedLinearUnit{False}, x_linear, x_gate, ps, st)
-    v, linear = m.linear(x_linear, ps.linear, st.linear)
-    g, gate = m.gate(x_gate, ps.gate, st.gate)
-    y = @. v * m.activation(g)
+function (m::GatedLinearUnit{False})(x::NTuple{2,<:AbstractArray}, ps, st)
+    v, linear = m.linear(x[1], ps.linear, st.linear)
+    g, gate = m.gate(x[2], ps.gate, st.gate)
+    y = @. v * m.activation(g)  # TODO: consider in place
     return y, (; linear, gate)
 end
