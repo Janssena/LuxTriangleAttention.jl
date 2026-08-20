@@ -1,5 +1,6 @@
 """
-    Attention(chn_q, chn_k, chn_v, head_dim, num_heads; use_bias=false, fuse_qkv=true, use_gate=static(true), bias_layout=:kq)
+    Attention(chn_q, chn_k, chn_v, head_dim, num_heads; use_bias=false, fuse_qkv=true,
+        use_gate=static(true), bias_layout=:kq, chunk_size=nothing, use_kernel=static(false))
     Attention(chn_q, chn_kv, head_dim, num_heads; kwargs...)
     Attention(chn_in, head_dim, num_heads; kwargs...)
 
@@ -18,6 +19,17 @@ Multi-head attention layer. Supports self-attention, cross-attention, and gated 
 - `fuse_qkv`: If `true`, fuses the Q, K, and V projections into a single dense layer 
   (where possible).
 - `use_gate`: If `true` (or `static(true)`), applies a sigmoid gating to the attention output.
+- `use_kernel`: If `true` (or `static(true)`), routes attention through the default (or user-defined) 
+  fused kernel (see [`register_kernel!`](@ref) / [`use_kernel!`](@ref) / [`tune_flash_kernel!`](@ref)) 
+  instead of `Lux.scaled_dot_product_attention`. Defaults to `false`.
+
+  This only takes effect on GPU arrays. On CPU, [`_sdpa_kernel`](@ref) always runs the ordinary
+  softmax regardless of this flag. A model built with `use_kernel=true` still runs (correctly, 
+  just without the speedup); the flag applies the moment the arrays are actually on a device with a 
+  usable kernel selected.
+
+  Mutually exclusive with `chunk_size`: a fused kernel tiles the keys internally, so there is nothing
+  left for `chunk_size` to slice, and combining the two raises `AssertionError` at construction.
 - `bias_layout`: A `Symbol` (either `:qk` or `:kq`) indicating how the attention bias tensor 
   should be prepared internally. Defaults to `:kq`.
   - `:qk`: Used in `TriangleAttention`. Expects a bias of shape `[H, Ni, Nj, B]`, which is 
@@ -26,8 +38,37 @@ Multi-head attention layer. Supports self-attention, cross-attention, and gated 
     bias is required.
   - `:kq`: Used in pair-bias implementations (e.g., MSA or general pair representations). 
     Expects a bias of shape `[H, Nq, Nk, B]`, which is permuted/transposed to `[Nk, Nq, H, 1, B]` 
-    to correct for the difference between Julia Lux's 3rd-dimension attention and Python's 
+    to correct for the difference between Julia Lux's 3rd-dimension attention and Python's
     4th-dimension attention when working with inputs of shape `[C, N, S, B]` (vs Python's `[B, S, N, C]`).
+- `chunk_size`: If given, run the attention in slices of `chunk_size` along dim 4 of the prepared
+  q/k/v instead of all at once. Defaults to `nothing` (no chunking). The result is unchanged but the 
+  live score tensor shrinks from `[Nq, Nk, H, dim4, …]` to `chunk_size` entries at a time.
+
+  Attention runs over `token_dim=3`, so dim 4 is the first axis it batches over and for a pair input 
+  `[C, Ni, Nj, B]` that is **`Nj`, a token axis, not the sample batch**. Chunking therefore helps at 
+  `B == 1`, whose scores are O(N³·H), ~1 GiB per op at N=400. For a 3-D input `[C, N, B]` dim 4 *is* 
+  the sample batch, so `chunk_size` is a no-op at `B == 1`. Equivalent to `chunk_size_tri_attn` in the 
+  openfold/boltz references.
+
+  Under `Reactant.@compile` the Reactant extension rolls the chunk loop into a `stablehlo.while`;
+  the plain Julia loop here would be unrolled and scheduled concurrently, preventing any reductions in 
+  memory usage.
+
+  !!! warning "Verify the REVERSE before relying on a specific chunk size"
+      Differentiating the rolled loop hits an unfixed Reactant/Enzyme defect for some
+      configurations: the chunk write lowers to a `dynamic_update_slice` whose update has one rank
+      too many (`update rank does not match operand rank: 6 vs 5`). The FORWARD is unaffected.
+
+      No rule predicts it. Measured on a bare `Attention` (chn=32, head_dim=8, num_heads=4), the
+      same at every `N` tried (8, 12, 16, 20, 24):
+
+      | nchunks | 2 | 3 | 4 | 5 | 6 |
+      |:--------|:-:|:-:|:-:|:-:|:-:|
+      | reverse | ✗ | ✗ | ✓ | ✗ | ✓ |
+
+      A specific nchunks might work or fail depending on the surrounding layer (e.g. a PairFormer block
+      featuring TriangleAttention layers). Eliminated as causes: the chunked axis's position and
+      rank, the loop body, the number of carried buffers, mask, bias, `num_heads`, and absolute `N`.
 
 ## Inputs
 - `x`: Input tensor(s). Can be an `AbstractArray` for self-attention, or a `Tuple` of 
@@ -64,10 +105,12 @@ typically attend over the 4th dimension.
 
 - **TriangleAttention (`bias_layout=:qk`)**:
   In `TriangleAttention`, we pass a bias of shape `[H, Ni, Nj, B]` which is permuted internally to enable the model to attend to the 3rd dimension in `q, k, v` (representing `Nj`). The input is of size `[C, Ni, Nj, B]`. Permuting the input also permutes the resulting bias correctly, meaning no additional changes to the bias orientation are needed.
-- **AttentionPairBias (`bias_layout=:kq`)**:
+- **Generic pair-bias attention (`bias_layout=:kq`)**, matching the layout of the `AttentionPairBias`
+  module in the AlphaFold3/Boltz Python references.
   For generic pair bias attention, the input is of shape `[C, N, S, B]` (where `S` is the pair/MSA dimension), and we attend over the `N` dimension. In Python, the equivalent shape is `[B, S, N, C]`. While the Julia input layout works naturally with Lux's 3rd-dimension attention default, the bias tensor of shape `[H, Nq, Nk, B]` must be permuted to `[Nk, Nq, H, 1, B]` to correct for the transposition. This is handled by the `:kq` layout.
 """
-struct Attention{SG,QKV,G,O,BIAS} <: Lux.AbstractLuxContainerLayer{(:qkv, :gate, :out)}
+struct Attention{SG,QKV,G,O,BIAS,CS<:Union{Nothing,Int},UK<:StaticBool} <:
+       Lux.AbstractLuxContainerLayer{(:qkv, :gate, :out)}
     should_gate::SG
     qkv::QKV
     gate::G
@@ -75,6 +118,8 @@ struct Attention{SG,QKV,G,O,BIAS} <: Lux.AbstractLuxContainerLayer{(:qkv, :gate,
     head_dim::Int
     num_heads::Int # H
     bias_layout::BIAS
+    chunk_size::CS
+    use_kernel::UK
 end
 
 Attention(chn_in::Int, head_dim::Int, num_heads::Int; kwargs...) =
@@ -91,9 +136,14 @@ Note: the forward function expects bias to be in the correct shape!!
 """
 function Attention(
     chn_q::Int, chn_k::Int, chn_v::Int, head_dim::Int, num_heads::Int;
-    use_bias=false, fuse_qkv::Bool=true, use_gate=static(true), bias_layout::Symbol=:kq
+    use_bias=false, fuse_qkv::Bool=true, use_gate=static(true), bias_layout::Symbol=:kq,
+    chunk_size::Union{Nothing,Int}=nothing, use_kernel::Union{Bool,StaticBool}=static(false)
 )
     @assert bias_layout == :qk || bias_layout == :kq "`bias_layout` must be :qk or :kq."
+    @assert isnothing(chunk_size) || chunk_size > 0 "`chunk_size` must be a positive integer."
+    @assert !(dynamic(use_kernel) && !isnothing(chunk_size)) "`use_kernel` and \
+        `chunk_size` are alternative ways to keep the score tensor small and cannot be combined: \
+        a kernel tiles the keys internally, so there is nothing left for `chunk_size` to slice."
 
     use_bias = resolve_defaults(use_bias, (:qkv, :q, :kv, :k, :v, :gate, :out))
     use_gate_static = static(use_gate)
@@ -135,7 +185,9 @@ function Attention(
         out,
         head_dim,
         num_heads,
-        static(bias_layout)
+        static(bias_layout),
+        chunk_size,
+        static(use_kernel)
     )
 end
 
@@ -147,12 +199,12 @@ end
     ps, st
 )
 
-(l::Attention)(x::Union{<:Tuple,AbstractArray{T}}, ps, st) where T = l(x, nothing, nothing, ps, st)
-(l::Attention)(x::Union{<:Tuple,AbstractArray{T}}, bias::AbstractArray{T}, ps, st) where T =
+(l::Attention)(x, ps, st) = l(x, nothing, nothing, ps, st)
+
+(l::Attention)(x, bias::AbstractArray{T}, ps, st) where T<:Number = 
     l(x, bias, nothing, ps, st)
 
-(l::Attention)(x::Union{<:Tuple,AbstractArray{T}}, mask::AbstractArray{Bool}, ps, st) where T =
-    l(x, nothing, mask, ps, st)
+(l::Attention)(x, mask::AbstractArray{Bool}, ps, st) = l(x, nothing, mask, ps, st)
 
 # x is either [C, N, B], [C, N, N, B] or [C, N, S, B]
 function (l::Attention)(x, bias, mask, ps, st)
@@ -161,12 +213,7 @@ function (l::Attention)(x, bias, mask, ps, st)
     mask = prep_mask(mask)
     bias = prep_bias(bias, x, l.bias_layout)
 
-    attn, _ = Lux.scaled_dot_product_attention(
-        q, k, v;
-        head_dim=1, token_dim=3, # attends over token dim (= 4 in python)
-        mask,
-        bias
-    )
+    attn = _sdpa(l.use_kernel, l.chunk_size, q, k, v, mask, bias)
 
     _dims = size(attn)[3:end] # [N, B] or [N, S, B] dims
     attn = reshape(attn, l.head_dim * l.num_heads, _dims...)
@@ -175,6 +222,55 @@ function (l::Attention)(x, bias, mask, ps, st)
     y, st_out = l.out(attn, ps.out, st.out)
 
     return y, (qkv=st_qkv, gate=st_gate, out=st_out)
+end
+
+"""
+    _sdpa(use_kernel, chunk_size, q, k, v, mask, bias)
+
+Entry point from the layer forward: pick how the score tensor is kept small, by the *types* of the
+two knobs rather than by branching on their values.
+
+| `use_kernel` | `chunk_size` | route |
+|:--|:--|:--|
+| `False` | `nothing` | [`_sdpa`](@ref) — `Lux.scaled_dot_product_attention` |
+| `False` | `Int`     | [`_chunked_sdpa`](@ref) — slice dim 4 |
+| `True`  | `nothing` | [`_sdpa_kernel`](@ref) — a fused kernel for this device |
+| `True`  | `Int`     | error: the two are alternatives, not a combination |
+
+Every route here returns just the bare output array: `Attention`'s forward reshapes and gates it
+directly. `_sdpa_kernel` itself always returns an `(output, lse)` PAIR — `lse` is the residual a
+device kernel's reverse rule needs, and `nothing` on the host path, where there is no reverse rule
+to feed — so the `use_kernel=true` route below unwraps it with a plain `first`, unconditionally,
+rather than testing the shape of the result. See [`_sdpa_kernel`](@ref)'s docstring in
+`src/kernels/backend.jl` for the full routing.
+"""
+_sdpa(::False, chunk_size::Int, q, k, v, mask, bias) =
+    _chunked_sdpa(chunk_size, q, k, v, mask, bias)
+
+# `_sdpa_kernel` should always return an `(output, lse)` pair: `lse` is the reverse rule's residual 
+# on a device path and `nothing` on the host path, where there is no reverse rule to feed. Because 
+# the shape is unconditional, unwrapping is a plain `first` rather than a runtime test of the result.
+function _sdpa(::True, ::Nothing, q, k, v, mask, bias) 
+    out, _ = _sdpa_kernel(q, k, v, mask, bias)
+    return out
+end
+
+_sdpa(::True, ::Int, args...) = throw(ArgumentError(
+    "`use_kernel=true` cannot be combined with a `chunk_size`: a fused kernel already " *
+    "tiles the keys internally, so there is no full score tensor left for `chunk_size` to " *
+    "slice. Drop one of the two."))
+
+_sdpa(::False, ::Nothing, q, k, v, mask, bias) = _sdpa_default(q, k, v, mask, bias)
+
+# The bare 5-arg form `_chunked_sdpa`/`layers/chunk.jl` calls when there is nothing left to chunk
+# (`chunk_size >= L`, or `chunk_size === nothing`)
+_sdpa(q, k, v, mask, bias) = _sdpa_default(q, k, v, mask, bias)
+
+function _sdpa_default(q, k, v, mask, bias)
+    output, _scores = Lux.scaled_dot_product_attention(
+        q, k, v; head_dim=1, token_dim=3, mask, bias
+    )   # attends over token dim (= 4 in python)
+    return output
 end
 
 # fused qkv

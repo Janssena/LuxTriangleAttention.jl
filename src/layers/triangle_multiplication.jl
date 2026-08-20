@@ -1,5 +1,5 @@
 """
-    TriangleMultiplication(chn_in, hidden_chn; is_outgoing=true, kwargs...)
+    TriangleMultiplication(chn_in, chn_hidden; is_outgoing=true, kwargs...)
 
 Implementation of Triangle Multiplication (Algorithm 11 & 12 from AlphaFold2).
 Updates the pair representation by combining edges sharing a common node.

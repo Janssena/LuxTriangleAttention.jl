@@ -22,6 +22,10 @@ Updates the pair representation by performing axial attention with a triangle bi
 - `x`: Input tensor with shape `[C, Ni, Nj, B]`.
 - `mask`: Optional mask with shape `[Ni, Nj, B]`.
 
+The triangle bias is NOT a user-supplied input: `linear` projects it from `x` itself
+(`b = Linear(x_norm)`, shape `[H, Ni, Nj, B]`). It is then handed to the inner [`Attention`](@ref)
+with `bias_layout=:qk`, which calls [`prep_bias`](@ref) on it internally.
+
 ## Returns
 - `y`: Output tensor with shape `[C, Ni, Nj, B]`.
 - `st`: Updated state.
@@ -35,13 +39,9 @@ ps, st = Lux.setup(Random.default_rng(), model)
 
 x = randn(Float32, 64, 32, 32, 1)
 mask = rand(Bool, 32, 32, 1) # Pairwise boolean mask
-raw_bias = randn(Float32, 4, 32, 32, 1) # Raw triangle bias
 
-# Prepare bias for internal mechanism
-bias = prep_triangle_bias(raw_bias)
-
-# Pass via NamedTuple
-y, st = model((; x, mask, bias), ps, st)
+# Pass inputs via NamedTuple; the bias is computed internally, not supplied here
+y, st = model((; x, mask), ps, st)
 ```
 """
 struct TriangleAttention{P<:StaticBool,LN,B,MHA} <: Lux.AbstractLuxContainerLayer{(:layer_norm, :linear, :mha)}
