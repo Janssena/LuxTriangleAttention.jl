@@ -1,3 +1,23 @@
+# Implemented by the Reactant extension, which owns the rolled chunk loop these concern. Declared
+# here so callers reach them as `LuxTriangleAttention.chunked_compile_options()` instead of digging
+# the extension module out of `Base.get_extension`.
+"""
+    chunked_compile_options(; kwargs...)
+
+`Reactant.CompileOptions` under which a `chunk_size`d attention stays rolled rather than being
+optimized back into the unchunked graph. Requires Reactant to be loaded; the method in
+`LuxTriangleAttentionReactantExt` documents which passes it holds off and why.
+"""
+function chunked_compile_options end
+
+"""
+    check_rolled(mod)
+
+Whether an optimized `@code_hlo` module still contains a `stablehlo.while` — i.e. whether the
+chunking actually survived. Requires Reactant to be loaded.
+"""
+function check_rolled end
+
 """
     _chunked_sdpa(chunk_size, q, k, v, mask, bias)
 
