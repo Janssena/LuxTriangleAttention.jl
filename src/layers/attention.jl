@@ -250,7 +250,15 @@ _sdpa(::False, chunk_size::Int, q, k, v, mask, bias) =
 # `_sdpa_kernel` should always return an `(output, lse)` pair: `lse` is the reverse rule's residual 
 # on a device path and `nothing` on the host path, where there is no reverse rule to feed. Because 
 # the shape is unconditional, unwrapping is a plain `first` rather than a runtime test of the result.
-function _sdpa(::True, ::Nothing, q, k, v, mask, bias) 
+function _sdpa(::True, ::Nothing, q, k, v, mask, bias)
+    # The kernel is SELF-attention-shaped: keys are read at the queries' own extent (`n`), so a
+    # cross-attention call (Boltz2/AF3's windowed atom attention: 32 queries against 128 keys)
+    # would be mis-addressed rather than rejected. Refuse it here, where the shapes are still the
+    # layer's own and the message can say which knob to turn off.
+    size(k)[3:end] == size(q)[3:end] || throw(ArgumentError(
+        "`use_kernel=true` needs self-attention-shaped q/k (the fused kernel reads keys at the " *
+        "query extent); got q $(size(q)) and k $(size(k)). Use `use_kernel=false` for this " *
+        "(cross/windowed) attention."))
     out, _ = _sdpa_kernel(q, k, v, mask, bias)
     return out
 end
@@ -368,6 +376,11 @@ Julia's `Lux` default is to attend over the 3rd dimension (`[C, N, S, B]`).
 The `bias_layout` determines how the bias tensor is adjusted to maintain parity with the Python attention mechanisms under these different dimension conventions.
 """
 prep_bias(::Nothing, args...) = nothing
+
+# Cross-attention: `x` is the `(q, k, v)` tuple. The bias layout is decided by the query, so
+# dispatch on `q` — same convention as `_gate_maybe` below.
+prep_bias(bias::AbstractArray, x::Tuple, bias_layout::StaticSymbol) =
+    prep_bias(bias, first(x), bias_layout)
 
 # As in AttentionPairBias:
 function prep_bias(bias::AbstractArray{T,4}, ::AbstractArray{T,4}, ::StaticSymbol{:kq}) where T
