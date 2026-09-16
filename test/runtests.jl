@@ -3,7 +3,7 @@ import Random
 
 using Test, LuxTriangleAttention, BenchmarkTools
 
-include("python/setup.jl");
+include("python/setup.jl");   # convert_types — shared, by inclusion order, with test/layers/
 
 @testset "LuxTriangleAttention.jl" begin
     @testset "Layers" begin
