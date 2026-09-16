@@ -44,10 +44,10 @@
 # legal, see `candidate_configs`) without touching the arithmetic that needs the range.
 
 """
-    flash_fwd!(o, lse, q, k, v, bias, mask, scale, neg_inf, n, nh, mheads,
+    flash_fwd!(o, lse, q, k, v, bias, mask, scale, neg_inf, n, nouter, nh, mheads,
         Val(T), Val(DIM), Val(TG), Val(KT))
 
-Fused triangle attention forward: online softmax over key tiles, one thread per query.
+Fused attention forward: online softmax over key tiles, one thread per query.
 
 `unsafe_indices=true` drops KernelAbstractions' implicit `__validindex` guard. That is deliberate and safe: the
 kernel does its own bounds handling via `active = j < n`, and dropping the guard is what allows the
@@ -59,19 +59,25 @@ their result is simply never stored. This is what makes the kernel correct at AN
 padding to a multiple of the tile size.
 
 # Layout
-`q`, `k`, `v`, `o` are `[DIM, nh, n, n, B]` with `DIM` fastest and element type `T`, where `nh` is
+`n` is the attended length (queries = keys) and `nouter` the OUTER length the attention is batched over.
+They are equal for triangle attention (`[C, N, N, B]`), and differ for everything else: MSA row
+attention attends over `n = N_res` for each of `nouter = N_seq` rows, column attention the reverse, and a
+plain `[C, N, B]` sequence has `nouter = 1`.
+
+`q`, `k`, `v`, `o` are `[DIM, nh, n, nouter, B]` with `DIM` fastest and element type `T`, where `nh` is
 the number of heads interleaved between the channel and query axes: `nh = 1` is the packed
-`[DIM, n, n, bh]` case. `bias` is `[n, n, bh]` of `T`; `lse` is `[n, nh, n, B]` of `Float32`
-(`[n, n, bh]` when `nh = 1`). `mask` is `[n, n, bh ÷ mheads]` of `Bool`, see `mheads` below; the
-common case is one mask per batch element, `[n, n, B]`. All raw pointers; see the note at the top
-of this file. See the addressing comment in the body for why `nh` is a runtime argument.
+`[DIM, n, nouter, bh]` case. `bias` is `[n, n, bh]` of `T` — keys fastest, and shared by every outer
+index, which is exactly a pair bias; `lse` is `[n, nh, nouter, B]` of `Float32` (`[n, nouter, bh]` when
+`nh = 1`). `mask` is `[n, nouter, bh ÷ mheads]` of `Bool` (a KEY mask per outer index), see `mheads`
+below; the common case is one mask per batch element, `[n, nouter, B]`. All raw pointers; see the note
+at the top of this file. See the addressing comment in the body for why `nh` is a runtime argument.
 
 # Precision
 `T` is storage only. `scale`, `neg_inf`, every accumulator and `lse` are `Float32`, see note 3 at
 the top of this file for why that is a requirement and not a default.
 """
 @kernel unsafe_indices = true function flash_fwd!(o, lse, q, k, v, bias, mask,
-    scale, neg_inf, n, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}) where {T,DIM,TG,KT}
+    scale, neg_inf, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}) where {T,DIM,TG,KT}
     ks = @localmem T (DIM, KT)
     vs = @localmem T (DIM, KT)
 
@@ -79,7 +85,7 @@ the top of this file for why that is a requirement and not a default.
     tid = Int32(@index(Local, Linear))
 
     jt = Int32(gx) - Int32(1)       # query tile
-    i = Int32(gy) - Int32(1)        # outer triangle index, one per group, by construction
+    i = Int32(gy) - Int32(1)        # outer index in `0:nouter-1`, one per group, by construction
     bh = Int32(gz) - Int32(1)       # batch * head
     j = jt * Int32(TG) + tid - Int32(1)
 
@@ -98,7 +104,7 @@ the top of this file for why that is a requirement and not a default.
     hi = bh % nh                      # head index within its batch element
     bi = bh ÷ nh                      # batch element
     nn = n * n
-    row = (bi * n + i) * n            # first query slot of this (batch, i) row
+    row = (bi * nouter + i) * n       # first query slot of this (batch, i) row
     hstep = nh * Int32(DIM)           # elements from one query slot to the next
     qb = (row + js) * hstep + hi * Int32(DIM)
     kb = row * hstep + hi * Int32(DIM)
@@ -108,8 +114,8 @@ the top of this file for why that is a requirement and not a default.
     # `nh` is not the true head count, which is exactly the packed `nh = 1` case, where `bh`
     # conflates heads and batch with no way to recover the split from `nh` alone. `mheads` is that
     # true head count, supplied separately, so `bh ÷ mheads` is always the real batch index.
-    mb = (bh ÷ mheads) * nn + i * n
-    lrow = (bi * n + i) * nh + hi     # `lse` has no channel axis, so it strides differently
+    mb = ((bh ÷ mheads) * nouter + i) * n
+    lrow = (bi * nouter + i) * nh + hi # `lse` has no channel axis, so it strides differently
 
     qv = _kload(q, qb, Val(DIM))
     accv = ntuple(Returns(zero(Float32)), Val(DIM))
@@ -203,16 +209,17 @@ pointerref)".
 end
 
 """
-    launch_geometry(n, heads, tg) -> (; ndrange, workgroupsize, ngroups)
+    launch_geometry(n, heads, tg; nouter=n) -> (; ndrange, workgroupsize, ngroups)
 
 The launch parameters for a problem, in the 1-D form KernelAbstractions requires (see the note at the top).
 
 `ndrange` is expressed in THREADS and is what the context's iterspace is built from; `ngroups` is
-the number of groups a backend should actually dispatch, as a 1-D grid.
+the number of groups a backend should actually dispatch, as a 1-D grid. `nouter` is the outer
+extent (see [`flash_fwd!`](@ref)); it defaults to `n`, the triangle-attention case.
 """
-function launch_geometry(n::Integer, heads::Integer, tg::Integer)
-    ndrange = (cld(n, tg) * tg, n, heads)
-    return (; ndrange, workgroupsize=(tg, 1, 1), ngroups=cld(n, tg) * n * heads)
+function launch_geometry(n::Integer, heads::Integer, tg::Integer; nouter::Integer=n)
+    ndrange = (cld(n, tg) * tg, nouter, heads)
+    return (; ndrange, workgroupsize=(tg, 1, 1), ngroups=cld(n, tg) * nouter * heads)
 end
 
 """
@@ -233,15 +240,19 @@ kernel_object(backend, tg::Integer; ndrange=nothing) =
     flash_fwd!(backend, (tg, 1, 1), ndrange)
 
 """
-    kernel_context(backend, n, heads, tg; static=false) -> (ctx, ngroups, is_ghost)
+    kernel_context(backend, n, heads, tg; nouter=n, static=false) -> (ctx, ngroups, is_ghost)
 
 Build the KernelAbstractions launch context for a problem.
 
 The context is produced by `KernelAbstractions.mkcontext`, never by hand: a backend that needs it in a buffer should
 upload this value as-is. Its internal layout is KernelAbstractions's business and must not be assumed.
+
+`nouter` changes only the iterspace the context CARRIES, never the compiled code, so one binary
+serves every `(n, nouter)` — except under `static`, which bakes the whole ndrange in.
 """
-function kernel_context(backend, n::Integer, heads::Integer, tg::Integer; static::Bool=false)
-    g = launch_geometry(n, heads, tg)
+function kernel_context(backend, n::Integer, heads::Integer, tg::Integer;
+    nouter::Integer=n, static::Bool=false)
+    g = launch_geometry(n, heads, tg; nouter)
     obj = kernel_object(backend, tg; ndrange=(static ? g.ndrange : nothing))
     nd, _, iterspace, _ = KernelAbstractions.launch_config(obj, g.ndrange, g.workgroupsize)
     ctx = KernelAbstractions.mkcontext(obj, nd, iterspace)
@@ -256,8 +267,9 @@ ordering here is the contract the `stablehlo.custom_call` binds against.
 
 `PT` is a pointer to the storage type `T` (used for `q`, `k`, `v`, `o`, `bias`), `PL` a pointer to
 `Float32` (the `lse` residual, which is never narrowed), and `PB` a pointer to `Bool` (the mask).
+The four `Int32`s are `n`, `nouter`, `nh`, `mheads`.
 """
 kernel_signature(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
     ::Type{T}, dim, tg, kt) where {C,PT,PL,PB,T} =
-    Tuple{C,PT,PL,PT,PT,PT,PT,PB,Float32,Float32,Int32,Int32,Int32,
+    Tuple{C,PT,PL,PT,PT,PT,PT,PB,Float32,Float32,Int32,Int32,Int32,Int32,
         Val{T},Val{dim},Val{tg},Val{kt}}
