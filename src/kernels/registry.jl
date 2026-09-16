@@ -50,6 +50,10 @@ Three groups, kept in one table so a role can never be classified two ways:
 LuxTriangleAttention-layout calls (both equal the head count) but not for packed `[dim, n, n, bh]`
 callers, where `nh = 1` and `mheads` is the true head count — see `flash_fwd!`'s addressing comment.
 Collapsing them would silently mis-address the mask on the packed path.
+
+`nouter` is the outer extent the attention is batched over (`Nj` of `[hd, H, Nq, Nj, B]`). A stage
+that does not declare it was compiled for triangle attention, where it is implicitly `n`, and can
+only run square problems — see [`supports_nouter`](@ref).
 """
 const _ROLE_RANK = Dict{Symbol,Int}(
     # outputs
@@ -59,13 +63,13 @@ const _ROLE_RANK = Dict{Symbol,Int}(
     :q => 200, :k => 201, :v => 202, :bias => 203, :mask => 204,
     :dO => 205, :o_in => 206, :lse_in => 207, :delta_in => 208,
     # scalars
-    :scale => 300, :neg_inf => 301, :n => 302, :nh => 303, :mheads => 304,
-    :h => 305, :dim => 306,
+    :scale => 300, :neg_inf => 301, :n => 302, :nouter => 303, :nh => 304, :mheads => 305,
+    :h => 306, :dim => 307,
 )
 
 const _OUTPUT_ROLES = Set([:o, :lse, :delta, :dq, :dk, :dv, :dbias])
 const _INPUT_ROLES = Set([:q, :k, :v, :bias, :mask, :o_in, :lse_in, :delta_in, :dO])
-const _SCALAR_ROLES = Set([:scale, :neg_inf, :n, :nh, :mheads, :h, :dim])
+const _SCALAR_ROLES = Set([:scale, :neg_inf, :n, :nouter, :nh, :mheads, :h, :dim])
 
 """
     _GRID_AXES
@@ -103,8 +107,12 @@ what it writes.
 # Fields
 - `name`: identifier within the entry (`:fwd`, `:dq`, `:dkv`, …). Only `:fwd` is meaningful to the
   forward path; the rest are run in order by the backward.
-- `file`: basename inside the entry's cache directory.
+- `file`: basename inside the entry's cache directory. Carries the stage's [`stage_id`](@ref), so
+  two variants of one entry (dim=16 and dim=32, say) never write over each other's binary.
 - `entry`: the symbol to look up inside the binary.
+- `id`: short hash of the variant key, the stage name and the source binary's bytes. It is what
+  makes `file` unique per variant, and it is recorded here (and in the manifest) so a stored entry
+  can be matched back to the file on disk without re-deriving it.
 - `outputs`, `inputs`, `scalars`: roles this stage touches, as SETS — order is imposed by
   [`abi_order`](@ref), never taken from these vectors.
 - `grid`: three symbols from `(:cdiv_n_bj, :cdiv_n_bk, :n, :bh, :one)`, resolved against the
@@ -115,11 +123,40 @@ struct KernelStage
     name::Symbol
     file::String
     entry::String
+    id::String
     outputs::Vector{Symbol}
     inputs::Vector{Symbol}
     scalars::Vector{Symbol}
     grid::NTuple{3,Symbol}
     threadgroup::Int
+end
+
+"""
+    supports_nouter(stage) -> Bool
+
+Whether a stage takes the outer extent as its own argument, and so can run `Nq ≠ Nj`.
+
+A stage without it — a third-party triangle kernel, or a `:$(RESERVED_KERNEL_NAME)` entry registered
+before the argument existed — hard-codes the outer extent to `n`. Handing it a rectangular problem
+does not fail: it walks the wrong rows and returns wrong numbers. Launchers check this and refuse.
+"""
+supports_nouter(stage::KernelStage) = :nouter in stage.scalars
+
+"""
+    check_nouter(entry, stages, nq, nj)
+
+Refuse a rectangular problem (`nq ≠ nj`) on any stage without [`supports_nouter`](@ref).
+"""
+function check_nouter(entry, stages, nq::Integer, nj::Integer)
+    nq == nj && return nothing
+    bad = [s.name for s in stages if !supports_nouter(s)]
+    isempty(bad) || throw(ArgumentError(
+        "kernel `:$(entry.name)` stages $(bad) take no `:nouter` argument, so they only run " *
+        "square problems (Nq == Nj); got Nq = $nq, Nj = $nj. " *
+        (entry.name === RESERVED_KERNEL_NAME ?
+         "This `:$(RESERVED_KERNEL_NAME)` variant predates the argument — re-run `tune_flash_kernel!`." :
+         "Rebuild it to take `:nouter`, or use `use_kernel=false` for this layer.")))
+    return nothing
 end
 
 """
@@ -276,13 +313,21 @@ nbucket(n::Integer) = 1 << max(0, ceil(Int, log2(max(n, 1))))
 
 """
     variant_key(entry, T, dim, n) -> Tuple
+    variant_key(kfields, T, dim, n) -> Tuple
 
 The lookup key for one problem, holding only the fields `entry.keys` declares. An entry that varies
 over nothing has key `()` and a single variant.
+
+The `kfields` method exists for [`register_kernel!`](@ref), which needs the key BEFORE it has an
+entry to ask: the key is what makes a stage's [`stage_id`](@ref), and that names the file the binary
+is copied to.
 """
-function variant_key(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer) where {T}
+variant_key(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer) where {T} =
+    variant_key(entry.keys, T, dim, n)
+
+function variant_key(kfields::Vector{Symbol}, ::Type{T}, dim::Integer, n::Integer) where {T}
     vals = Any[]
-    for f in entry.keys
+    for f in kfields
         f === :dtype && push!(vals, nameof(T))
         f === :dim && push!(vals, Int(dim))
         f === :nbucket && push!(vals, nbucket(n))
@@ -324,26 +369,60 @@ end
 kernel_registry_dir() = joinpath(kernel_cache_root(), "kernels")
 entry_dir(name::Symbol) = joinpath(kernel_registry_dir(), String(name))
 
+"""
+    STAGE_ID_WIDTH
+
+How many hex digits of [`stage_id`](@ref)'s hash go into a filename. Eight is short enough to read
+in a directory listing and long enough that a collision between the handful of variants one entry
+holds is not a thing that happens.
+"""
+const STAGE_ID_WIDTH = 8
+
+"""
+    stage_id(key, stage, src) -> String
+
+Short hash naming one stage of one variant: `$(STAGE_ID_WIDTH)` hex digits over the variant `key`,
+the stage name, and the SOURCE binary's bytes.
+
+# Why the file name needs this at all
+Binaries used to be copied in as `<name>_<stage>.<ext>`, which says nothing about the VARIANT. Tune
+`:$(RESERVED_KERNEL_NAME)` for `dim=16` and then for `dim=32` and the second registration writes
+over the first one's binary: both variants stay in the manifest, both then point at the dim=32
+kernel, and the dim=16 entry either fails to find its entry point or — for a kernel whose entry name
+does not encode the configuration — runs the wrong binary and returns wrong numbers. Since the
+whole point of the registry is holding several tuned configurations at once, the file name has to
+distinguish them.
+
+The key alone would be enough for that, but the content is mixed in too so that re-registering a
+variant with a genuinely different binary lands on a new file rather than overwriting in place.
+Registering the SAME binary for the same key is idempotent: same id, same destination.
+"""
+function stage_id(key::Tuple, sname::Symbol, src::AbstractString)
+    h = hash(_key_strings(key), hash(String(sname)))
+    h = hash(read(src), h)
+    return first(string(h; base=16, pad=16), STAGE_ID_WIDTH)
+end
+
 # The role sets our own flash kernel uses. They are also the defaults for the
 # `register_kernel!(; name, fwd, dq, dk, dv)` form, so a kernel written against this package's
 # documented convention needs no role declarations at all.
 const _DEFAULT_ROLES = Dict(
     :fwd => (outputs=[:o, :lse],
         inputs=[:q, :k, :v, :bias, :mask],
-        scalars=[:scale, :neg_inf, :n, :nh, :mheads]),
+        scalars=[:scale, :neg_inf, :n, :nouter, :nh, :mheads]),
     # The backward stages take NO `neg_inf`: only the forward needs a sentinel to initialise the
     # running softmax maximum, and the backward reads `lse` instead of recomputing it. Declaring one
     # here would insert a Float32 ahead of `n` and shift every scalar after it, which does not
     # raise, it just makes `n` garbage and every loop a no-op, so the gradients come back all zero.
     :dq => (outputs=[:dq, :dbias],
         inputs=[:q, :k, :v, :bias, :mask, :dO, :lse_in, :delta_in],
-        scalars=[:scale, :n, :nh, :mheads]),
+        scalars=[:scale, :n, :nouter, :nh, :mheads]),
     :dk => (outputs=[:dk],
         inputs=[:q, :k, :v, :bias, :mask, :dO, :lse_in, :delta_in],
-        scalars=[:scale, :n, :nh, :mheads]),
+        scalars=[:scale, :n, :nouter, :nh, :mheads]),
     :dv => (outputs=[:dv],
         inputs=[:q, :k, :bias, :mask, :dO, :lse_in],
-        scalars=[:scale, :n, :nh, :mheads]),
+        scalars=[:scale, :n, :nouter, :nh, :mheads]),
 )
 
 const _DEFAULT_LAYOUT = [:hd, :H, :Nq, :Nj, :B]
@@ -430,19 +509,19 @@ backend_loaded(backend::Symbol) = backend in _LOADED_BACKENDS
 _stage_entrypoint(path) = splitext(basename(path))[1]
 
 """
-    _build_stage(name, file, spec; grid, threadgroup) -> KernelStage
+    _build_stage(name, file, spec; id, grid, threadgroup) -> KernelStage
 
 One stage from a file plus a role spec, filling in [`_DEFAULT_ROLES`](@ref) for the four stage names
 our own kernel uses.
 """
 function _build_stage(sname::Symbol, file::AbstractString, spec;
-    grid::NTuple{3,Symbol}, threadgroup::Int)
+    id::AbstractString, grid::NTuple{3,Symbol}, threadgroup::Int)
     roles = spec === nothing ? get(_DEFAULT_ROLES, sname) do
         throw(ArgumentError(
             "stage `:$sname` has no default role set; pass it explicitly via `stages=`. " *
             "Defaults exist only for " * join(["`:$k`" for k in keys(_DEFAULT_ROLES)], ", ")))
     end : spec
-    return KernelStage(sname, basename(file), _stage_entrypoint(file),
+    return KernelStage(sname, basename(file), _stage_entrypoint(file), String(id),
         collect(roles.outputs), collect(roles.inputs), collect(roles.scalars),
         grid, threadgroup)
 end
@@ -454,9 +533,12 @@ Register a compiled kernel, or add a configuration to one already registered.
 
 `fwd`, `dq`, `dk` and `dv` are paths to compiled binaries — `.metallib`, `.cubin`/`.fatbin`, or
 `.hsaco`/`.co`. All must share a format; the backend is inferred from it. The files are COPIED into
-the registry cache (`kernel_cache_root()/kernels/<name>/`) under stable names, so the entry keeps
-working after the originals move, and a TOML manifest is written beside them — which is what lets
-the registry rehydrate on the next Julia start without the user re-registering anything.
+the registry cache (`kernel_cache_root()/kernels/<name>/`) as `<name>_<stage>_<id>.<ext>`, where
+`id` is the variant's [`stage_id`](@ref), so the entry keeps working after the originals move AND
+registering a second variant (another `dim`, `dtype` or `n`) cannot write over the first one's
+binary. A TOML manifest is written beside them — which is what lets the registry rehydrate on the
+next Julia start without the user re-registering anything — and binaries no variant names any more
+are pruned.
 
 # Keyword arguments
 - `name`: entry name. `:$(RESERVED_KERNEL_NAME)` is reserved — see [`tune_flash_kernel!`](@ref).
@@ -545,24 +627,30 @@ function _register!(name::Symbol; fwd, dq, dk, dv, stages, dim, dtype, n,
     end
     format, backend = _classify(last.(srcs))
 
+    kfields = Symbol[:dtype, :dim]
+    n === nothing || push!(kfields, :nbucket)
+    # The key is needed HERE, before anything is copied: it is half of each stage's `stage_id`, and
+    # that is what keeps one variant's binaries off another's.
+    key = variant_key(kfields, dtype, dim, something(n, 1))
+
     dir = entry_dir(name)
     mkpath(dir)
     built = KernelStage[]
     for (sname, src) in srcs
         ext = lowercase(splitext(src)[2])
-        dst = joinpath(dir, "$(name)_$(sname)$(ext)")
-        # `force` so re-registering a name genuinely replaces the binary rather than silently
-        # keeping the old one, which would be indistinguishable from a successful update.
+        id = stage_id(key, sname, src)
+        dst = joinpath(dir, "$(name)_$(sname)_$(id)$(ext)")
+        # `force` so re-registering the same binary for the same variant genuinely replaces it
+        # rather than silently keeping the old one, which would be indistinguishable from a
+        # successful update. A DIFFERENT binary gets a different `id`, hence a different file, and
+        # the superseded one is pruned once the manifest no longer names it.
         cp(src, dst; force=true)
         st = _build_stage(sname, src, specs[sname];
-            grid=gridof[sname], threadgroup=tgof[sname])
-        push!(built, KernelStage(st.name, basename(dst), st.entry,
+            id, grid=gridof[sname], threadgroup=tgof[sname])
+        push!(built, KernelStage(st.name, basename(dst), st.entry, st.id,
             st.outputs, st.inputs, st.scalars, st.grid, st.threadgroup))
     end
     _validate_stages(built)
-
-    kfields = Symbol[:dtype, :dim]
-    n === nothing || push!(kfields, :nbucket)
 
     prev = get(_KERNELS, name, nothing)
     entry = if prev === nothing
@@ -579,10 +667,10 @@ function _register!(name::Symbol; fwd, dq, dk, dv, stages, dim, dtype, n,
         prev
     end
 
-    key = variant_key(entry, dtype, dim, something(n, 1))
     entry.variants[key] = built
     _KERNELS[name] = entry
     _save_entry(entry)
+    _prune_entry_dir(entry)
     return entry
 end
 
@@ -647,13 +735,15 @@ end
 _manifest_path(name::Symbol) = joinpath(entry_dir(name), "$(name).toml")
 
 _stage_dict(s::KernelStage) = Dict{String,Any}(
-    "name" => String(s.name), "file" => s.file, "entry" => s.entry,
+    "name" => String(s.name), "file" => s.file, "entry" => s.entry, "id" => s.id,
     "outputs" => String.(s.outputs), "inputs" => String.(s.inputs),
     "scalars" => String.(s.scalars),
     "grid" => [String(g) for g in s.grid], "threadgroup" => s.threadgroup)
 
+# `id` is read with a default: manifests written before stage ids existed name an unhashed file,
+# which is still perfectly loadable — it just cannot be re-derived, so it reports as empty.
 _stage_from(d::AbstractDict) = KernelStage(
-    Symbol(d["name"]), d["file"], d["entry"],
+    Symbol(d["name"]), d["file"], d["entry"], get(d, "id", ""),
     Symbol.(d["outputs"]), Symbol.(d["inputs"]), Symbol.(d["scalars"]),
     (Symbol(d["grid"][1]), Symbol(d["grid"][2]), Symbol(d["grid"][3])),
     Int(d["threadgroup"]))
@@ -695,6 +785,9 @@ function _save_entry(entry::KernelEntry)
             "stage" => [_stage_dict(s) for s in v])
                       for (k, v) in sort(collect(entry.variants); by=first ∘ string ∘ first)],
     )
+    # `:default` is compiled from THIS package's kernel sources, so a manifest for it records which
+    # sources, and `_load_entry` drops it once they change. See `_load_entry`.
+    entry.name === RESERVED_KERNEL_NAME && (tbl["source_tag"] = kernel_source_tag())
     path = _manifest_path(entry.name)
     open(path, "w") do io
         TOML.print(io, tbl)
@@ -703,10 +796,41 @@ function _save_entry(entry::KernelEntry)
 end
 
 """
+    _prune_entry_dir(entry) -> Vector{String}
+
+Delete binaries in `entry`'s directory that no variant names any more, returning what was removed.
+
+Now that a file name carries a [`stage_id`](@ref), replacing a variant's binary writes a NEW file
+instead of overwriting the old one, so without this every re-registration would leave its
+predecessor behind forever. Called after the manifest is written, so a file is only ever removed
+once the on-disk entry has stopped referring to it.
+"""
+function _prune_entry_dir(entry::KernelEntry)
+    dir = entry_dir(entry.name)
+    isdir(dir) || return String[]
+    keep = Set{String}(s.file for v in values(entry.variants) for s in v)
+    push!(keep, basename(_manifest_path(entry.name)))
+    removed = String[]
+    for f in readdir(dir)
+        f in keep && continue
+        rm(joinpath(dir, f); force=true)
+        push!(removed, f)
+    end
+    return removed
+end
+
+"""
     _load_entry(path) -> KernelEntry or `nothing`
 
 Read one manifest. Returns `nothing` — never throws — when the file is corrupt or any binary it
 names has gone missing.
+
+A `:$(RESERVED_KERNEL_NAME)` manifest is also dropped when it was written from different kernel
+sources than the ones loaded now (its `source_tag`, see [`kernel_source_tag`](@ref)). The registry
+holds COPIES of the binaries, so the source tag in the binary cache's own file names does not reach
+it: without this check an edited kernel would keep running its old binary, from the registry, until
+someone remembered to re-run `tune_flash_kernel!`. Dropping it makes the next call re-tune instead.
+User entries are never checked this way — their binaries have nothing to do with our sources.
 
 A half-present cache must not stop the package from loading. The cache directory is under
 `~/.cache` where anything may have been pruned, and the correct response to a broken entry is to
@@ -717,6 +841,8 @@ function _load_entry(path::AbstractString)
     return try
         raw = TOML.parsefile(path)
         name = Symbol(raw["name"])
+        name === RESERVED_KERNEL_NAME &&
+            get(raw, "source_tag", "") != kernel_source_tag() && return nothing
         kfields = Symbol.(raw["keys"])
         dir = dirname(path)
         variants = Dict{Tuple,Vector{KernelStage}}()

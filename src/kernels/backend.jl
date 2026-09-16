@@ -125,7 +125,31 @@ function _sdpa_kernel(be::GPUBackend, q, k, v, mask, bias)
     dim, n = size(q, 1), size(q, 3)
     stages = resolve_variant(entry, T, dim, n)
     stages === nothing && (stages = _ensure_variant(entry, T, dim, n))
-    return _sdpa_kernel_launch(be, entry, stages, q, k, v, mask, bias)
+    ndims(q) == 4 || return _sdpa_kernel_launch(be, entry, stages, q, k, v, mask, bias)
+    o, lse = _sdpa_kernel_launch(be, entry, stages, _seq5(q), _seq5(k), _seq5(v), mask, bias)
+    return reshape(o, size(q)), reshape(lse, 1, size(q, 3), size(q, 2), size(q, 4))
+end
+
+"""
+    _seq5(x)
+
+A plain sequence's `[hd, H, N, B]` operand as the rank-5 `[hd, H, N, 1, B]` every launcher speaks:
+attention over `N` batched over an outer extent of ONE. A pure reshape — the memory order is
+identical — and the mask (`[N, 1, 1, B]` from `prep_mask`) and bias (`[Nk, Nq, H, B]`) need none,
+since the launchers read them by element count as `[N, 1, B]` and `[N, N, H, B]`.
+"""
+function _seq5(x::AbstractArray{T,4}) where T 
+    hd, H, N, B = size(x)
+    return reshape(x, hd, H, N, 1, B)
+end
+
+# The backward for a plain sequence: the rank-5 backward on reshaped operands, gradients reshaped
+# back. `dbias` is returned as the launcher produced it; callers reshape it to `size(bias)`.
+function _sdpa_kernel_bwd!(q::AbstractArray{T,4}, k, v, mask, bias, o, lse, dO) where T
+    dq, dk, dv, dbias = _sdpa_kernel_bwd!(_seq5(q), _seq5(k), _seq5(v), mask, bias,
+        _seq5(o), reshape(lse, size(lse, 1), size(lse, 2), size(lse, 3), 1, size(lse, 4)), # TODO: can lse not use _seq5?
+        _seq5(dO))
+    return reshape(dq, size(q)), reshape(dk, size(k)), reshape(dv, size(v)), dbias
 end
 
 """

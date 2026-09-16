@@ -250,7 +250,9 @@ refuses that name. It:
  1. calibrates the device for `(dim, T)`, or reuses the persisted calibration ([`calibrate!`](@ref));
  2. picks the `(tg, kt)` configuration that minimises cost AT `n`, via [`choose_config`](@ref);
  3. ahead-of-time compiles the forward and all three backward kernels for it;
- 4. registers them as a variant keyed `(dtype, dim, nbucket(n))`.
+ 4. registers them as a variant keyed `(dtype, dim, nbucket(n))`, under file names carrying that
+    variant's [`stage_id`](@ref) — so tuning `dim=16` and then `dim=32` leaves BOTH tuned kernels on
+    disk and each `(dtype, dim, n)` resolves to its own binary.
 
 # Why `n` is a key rather than a per-call choice
 The compiled BINARY is independent of `n`, the kernel takes the length as a runtime argument. What
@@ -284,7 +286,8 @@ function tune_flash_kernel!(n::Integer; dim::Integer, T::Type=Float32, force::Bo
         preamble=FLASH_PREAMBLE,
         description="built-in KernelAbstractions flash kernel (tuned per sequence length)")
 
-    @debug "tuned flash kernel" n dim T tg kt nbucket = nbucket(n)
+    @debug "tuned flash kernel" n dim T tg kt nbucket = nbucket(n) ids = [s.id for s in
+        entry.variants[variant_key(entry, T, dim, n)]]
     return entry
 end
 
