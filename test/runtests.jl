@@ -13,4 +13,8 @@ include("python/setup.jl");   # convert_types — shared, by inclusion order, wi
     @testset "Layers" begin
         include("layers/runtests.jl")
     end
+
+    @testset "Extensions" begin
+        include("ext/runtests.jl")
+    end
 end
