@@ -1,28 +1,63 @@
-# The reverse of `flash_fwd!` (see `forward.jl`), the same three constraints (1-D group dispatch, raw
-# pointers not device arrays, Float32 accumulation) all apply here unchanged.
-# 
+# The reverse of `flash_fwd!` (see `forward.jl`), the same four constraints (1-D group dispatch, raw
+# pointers not device arrays, Float32 accumulation, no runtime-indexed register tuples) all apply
+# here unchanged, and so do its base-2 softmax and its additive staged key mask.
+#
 # None of the key-side kernels touch `dBias` — `flash_bwd_dq!` already covers every `(kk, js, bh)`
 # once per `i`, and accumulating it again would double-count it.
+#
+# ## Register pressure, and why there are three kernels
+#
+# Every thread keeps one row's vectors in registers: `flash_bwd_dq!` holds `q`, `dO` and the `dQ`
+# accumulator, `flash_bwd_dk!` holds `k`, `v` and `dK` — `3*DIM` floats each — and
+# `flash_bwd_dv!` holds `k` and `dV`, `2*DIM`, like the forward. Merging dK and dV into one kernel
+# would need `4*DIM`. On an M1 Pro the `3*DIM` kernels are the ones that hit the register ceiling at
+# `DIM = 32` (measured: dQ ~5x and dK ~3x the time of dV there, against ~1.5x at `DIM = 24`), so the
+# split stays. Moving the accumulator out of registers instead — `ds` staged to local memory and
+# folded into the OUTPUT buffer once per tile — was measured too, and is slower still. A device with
+# a larger register file does not have this ceiling; the tuner (`tune.jl`) picks each stage's
+# `(TG, KT)` independently so each kernel gets the geometry that suits its own footprint.
+#
+# ## Absent bias or mask
+#
+# Every kernel here takes the same compile-time `HB` (has bias) / `HM` (has mask) flags as
+# `flash_fwd!` (see its docstring). `HB = false` drops the bias term from every recomputed score
+# and, in `flash_bwd_dq!`, the `dbias` atomic as well; `HM = false` treats every in-range key as
+# live without reading `mask`. The pointers stay in the signature, so the ABI does not change.
+#
+# ## Bias layout per kernel
+#
+# `flash_bwd_dq!` owns one QUERY per thread, like the forward, so it reads the TRANSPOSED bias
+# (`:bias_t`, queries fastest) and accumulates `dBias` into a transposed buffer (`:dbias_t`) — both
+# coalesced across a SIMD group. `flash_bwd_dk!` and `flash_bwd_dv!` own one KEY per thread, for which
+# the ordinary keys-fastest `:bias` is already the coalesced layout, so they keep it.
 
 """
-    flash_bwd_dq!(dq, dbias, q, k, v, bias, mask, dO, lse, delta,
-        scale, n, nouter, nh, mheads, Val(T), Val(DIM), Val(TG), Val(KT))
+    flash_bwd_dq!(dq, dbias_t, q, k, v, bias_t, mask, dO, lse, delta,
+        scale, n, nouter, nh, mheads, Val(T), Val(DIM), Val(TG), Val(KT), Val(HB), Val(HM))
 
 Backward pass, `dQ`/`dBias` half: one thread per query, the same grid geometry as [`flash_fwd!`](@ref)
-(and the same tile-staging of `k`/`v`).
+(and the same tile-staging of `k`/`v` and of the key mask).
 
 `dQ[:, js, i, bh]` is written once, at the end, by the thread that owns `js`, no atomics. `dBias`
-is accumulated across the key-tile loop via [`_atomic_fadd!`](@ref): the address `bb + kk + 1` is
-shared by every `i` (bias has no `i` axis), so `nouter` threads across different groups can land on it,
-but never more than `nouter`, queries and keys otherwise sole-own their contribution.
+is accumulated across the key-tile loop via [`_atomic_fadd!`](@ref): the address is shared by every
+`i` (bias has no `i` axis), so `nouter` threads across different groups can land on it, but never
+more than `nouter`, queries and keys otherwise sole-own their contribution. `dbias_t` is the
+gradient of `bias_t`, i.e. in the transposed `[n (queries), n (keys), bh]` layout, which is what
+makes a SIMD group's 32 atomics land on 32 consecutive addresses.
 
-`dbias` MUST be zeroed by the caller before launch; `dq` need not be (every active thread's location
-is fully overwritten, exactly as the forward writes `o`).
+A dead key (masked, or past `n`) is skipped outright. Its staged mask term is shared by the whole
+group, so the branch is uniform — no divergence — and it saves the atomic as well as the arithmetic.
+
+`dbias_t` MUST be zeroed by the caller before launch; `dq` need not be (every active thread's
+location is fully overwritten, exactly as the forward writes `o`). With `HB = false` neither
+`bias_t` nor `dbias_t` is touched.
 """
-@kernel unsafe_indices = true function flash_bwd_dq!(dq, dbias, q, k, v, bias, mask, dO, lse, delta,
-    scale, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}) where {T,DIM,TG,KT}
+@kernel unsafe_indices = true function flash_bwd_dq!(dq, dbias_t, q, k, v, bias_t, mask, dO, lse, delta,
+    scale, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}, ::Val{HB},
+    ::Val{HM}) where {T,DIM,TG,KT,HB,HM}
     ks = @localmem T (DIM, KT)
     vs = @localmem T (DIM, KT)
+    ms = @localmem Float32 (KT,)
 
     gx, gy, gz = @index(Group, NTuple)
     tid = Int32(@index(Local, Linear))
@@ -42,14 +77,14 @@ is fully overwritten, exactly as the forward writes `o`).
     hstep = nh * Int32(DIM)
     qb = (row + js) * hstep + hi * Int32(DIM)
     kb = row * hstep + hi * Int32(DIM)
-    bb = bh * nn + js * n
+    btb = bh * nn + js                        # bias_t / dbias_t: (js, kk) at btb + kk * n
     mb = ((bh ÷ mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
-    lb = ((bi * nouter + i) * nh + hi) * n + j + Int32(1)
+    lb = ((bi * nouter + i) * nh + hi) * n + js + Int32(1)
 
-    qv = _kload(q, qb, Val(DIM))
+    qv = _kscale(_kload(q, qb, Val(DIM)), scale * _LOG2E)
     dov = _kload(dO, qb, Val(DIM))
-    lse_j = active ? unsafe_load(lse, lb) : zero(Float32)
-    delta_j = active ? unsafe_load(delta, lb) : zero(Float32)
+    lse2 = unsafe_load(lse, lb) * _LOG2E      # base 2, like the scores
+    delta_j = unsafe_load(delta, lb)
 
     dqv = ntuple(Returns(zero(Float32)), Val(DIM))
 
@@ -67,42 +102,36 @@ is fully overwritten, exactly as the forward writes `o`).
             @inbounds vs[d0+Int32(1), c0+Int32(1)] = vv
             e += Int32(TG)
         end
+        # `1` marks a dead key here, `0` a live one: only the live test below reads it.
+        _kstage_mask!(ms, mask, mb, t, n, tid, one(Float32), Val(TG), Val(KT), Val(HM))
         @synchronize
 
         if active
             for c in Int32(1):Int32(KT)
-                kk = t + c - Int32(1)
-                if kk < n
-                    @inbounds masked = unsafe_load(mask, mb + kk + Int32(1))
-                    if !masked
-                        s = _kdot(qv, ks, c) * scale +
-                            Float32(unsafe_load(bias, bb + kk + Int32(1)))
-                        p = exp(s - lse_j)
-                        dp = _kdot(dov, vs, c)
-                        ds = p * (dp - delta_j)
-                        dqv = _kaccum(dqv, ds * scale, ks, c)
-                        _atomic_fadd!(dbias, bb + kk + Int32(1), ds)
-                    end
+                if @inbounds ms[c] == zero(Float32)
+                    kk = t + c - Int32(1)
+                    s2 = _kdot(qv, ks, c) + _kbias(bias_t, btb + kk * n + Int32(1), Val(HB))
+                    p = exp2(s2 - lse2)
+                    ds = p * (_kdot(dov, vs, c) - delta_j)
+                    dqv = _kaccum(dqv, ds * scale, ks, c)
+                    HB && _atomic_fadd!(dbias_t, btb + kk * n + Int32(1), ds)
                 end
             end
         end
         t += Int32(KT)
     end
 
-    # `_kstore!` (from `forward.jl`) rather than an inline `ntuple(...) do d ... end` closure here: a
-    # closure capturing a kernel argument (`dq`, `qb`) loses its type under `@kernel` and fails to
-    # compile with "unsupported dynamic function invocation", see `_kdot`'s docstring in `forward.jl`.
-    # `inv_l = one(Float32)` makes it a plain store; the backward has nothing to divide by.
     active && _kstore!(dq, dqv, one(Float32), qb, T)
 end
 
 """
     flash_bwd_dk!(dk, q, k, v, bias, mask, dO, lse, delta,
-        scale, n, nouter, nh, mheads, Val(T), Val(DIM), Val(TG), Val(KT))
+        scale, n, nouter, nh, mheads, Val(T), Val(DIM), Val(TG), Val(KT), Val(HB), Val(HM))
 
 Backward pass, `dK`, one thread per KEY, streaming query tiles. The transposed geometry of
 [`flash_bwd_dq!`](@ref): `q`/`dO` (plus `lse`/`delta`) are staged into local memory instead of
-`k`/`v`, and the thread-resident registers hold this key's own `k`/`v` instead of `q`.
+`k`/`v`, and the thread-resident registers hold this key's own `k`/`v` instead of `q`. `bias` is the
+ordinary keys-fastest layout, which is the coalesced one for a thread per key.
 
 `dK[:, kk, i, bh]` is written once, by the thread that owns `kk`, no atomics, same reasoning as
 `dQ` above. Does NOT touch `dBias`; see the file header.
@@ -113,15 +142,15 @@ Holds `kv`, `vv` and the `dkv` accumulator, `3*DIM` registers, the same footprin
 separate kernels rather than one: see the register-pressure note in the file header.
 
 A masked key contributes nothing at any query (in the forward, `p = 0` there for every column), so
-`dK` is zero for it, applied as a zero factor at the store (see `keep` in the body for why not a
-branch), and never by an early return, since every thread in a group must still take part in the
-cooperative staging and its
-`@synchronize` calls regardless of its own `mask` value (masking is per-thread here, unlike the
-forward and `flash_bwd_dq!`, where it varies per loop ITERATION of a single thread: see the file
-header for why an uneven `@synchronize` count is not just wrong but unsafe).
+`dK` is written as ZERO for it — selected at the store, not multiplied in, so a non-finite
+accumulator (a fully-masked row's `lse = -Inf`) cannot leak through as `0 * Inf = NaN` — and never
+by an early return, since every thread in a group must still take part in the cooperative staging
+and its `@synchronize` calls regardless of its own `mask` value. A query past `n` in a ragged tile
+has its staged `lse` set to `+floatmax`, which makes its `p` exactly zero: no branch in the loop.
 """
 @kernel unsafe_indices = true function flash_bwd_dk!(dk, q, k, v, bias, mask, dO, lse, delta,
-    scale, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}) where {T,DIM,TG,KT}
+    scale, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}, ::Val{HB},
+    ::Val{HM}) where {T,DIM,TG,KT,HB,HM}
     qs = @localmem T (DIM, KT)
     dos = @localmem T (DIM, KT)
     lses = @localmem Float32 (KT,)
@@ -148,64 +177,38 @@ header for why an uneven `@synchronize` count is not just wrong but unsafe).
     mb = ((bh ÷ mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
     lrow = (bi * nouter + i) * nh + hi
 
-    masked = active ? unsafe_load(mask, mb + kks + Int32(1)) : true
-    # A masked key's gradient is ZERO, applied as a factor at the store rather than by skipping the
-    # loop body under `if active & !masked`. Measured: the data-dependent branch made this kernel
-    # 15-25% slower once the mask base involved the runtime `nouter` (the compiler's scheduling
-    # around it degrades), while the factor form is ~1% faster than the pre-`nouter` kernel on dense
-    # input and bit-identical. The cost moves to masked keys, which now do the arithmetic and
-    # discard it — only visible when a WHOLE SIMD group of keys is masked (long padding tails).
-    keep = (active & !masked) ? one(Float32) : zero(Float32)
+    masked = active ? (HM ? unsafe_load(mask, mb + kks + Int32(1)) : false) : true
+    live = active & !masked
 
-    kv = _kload(k, kb, Val(DIM))
+    kv = _kscale(_kload(k, kb, Val(DIM)), scale * _LOG2E)
     vv = _kload(v, kb, Val(DIM))
     dkv = ntuple(Returns(zero(Float32)), Val(DIM))
 
     t = Int32(0)
     while t < n
         @synchronize
-        e = tid
-        while e <= Int32(KT) * Int32(DIM)
-            d0 = (e - Int32(1)) % Int32(DIM)
-            c0 = (e - Int32(1)) ÷ Int32(DIM)
-            jj = t + c0
-            vq = jj < n ? unsafe_load(q, qb0 + jj * hstep + d0 + Int32(1)) : zero(T)
-            vdo = jj < n ? unsafe_load(dO, qb0 + jj * hstep + d0 + Int32(1)) : zero(T)
-            @inbounds qs[d0+Int32(1), c0+Int32(1)] = vq
-            @inbounds dos[d0+Int32(1), c0+Int32(1)] = vdo
-            # `lse`/`delta` are per-(query,i,bh) scalars: load them once per column, on the thread
-            # handling that column's first channel, rather than once per (channel, column).
-            if d0 == Int32(0)
-                jjl = jj < n ? jj + Int32(1) : Int32(1)
-                @inbounds lses[c0+Int32(1)] = jj < n ? unsafe_load(lse, lrow * n + jjl) : zero(Float32)
-                @inbounds deltas[c0+Int32(1)] = jj < n ? unsafe_load(delta, lrow * n + jjl) : zero(Float32)
-            end
-            e += Int32(TG)
-        end
+        _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid, Val(T), Val(DIM), Val(TG), Val(KT))
+        _kstage_stats!(lses, deltas, lse, delta, lrow * n, t, n, tid, Val(TG), Val(KT))
         @synchronize
 
-        if active
-            for c in Int32(1):Int32(KT)
-                jj = t + c - Int32(1)
-                if jj < n
-                    s = _kdot(kv, qs, c) * scale +
-                        Float32(unsafe_load(bias, bh * nn + jj * n + kks + Int32(1)))
-                    p = exp(s - lses[c])
-                    dp = _kdot(vv, dos, c)
-                    ds = p * (dp - deltas[c])
-                    dkv = _kaccum(dkv, ds * scale, qs, c)
-                end
-            end
+        for c in Int32(1):Int32(KT)
+            jj = min(t + c - Int32(1), n - Int32(1))
+            s2 = _kdot(kv, qs, c) + _kbias(bias, bh * nn + jj * n + kks + Int32(1), Val(HB))
+            p = @inbounds exp2(s2 - lses[c])
+            ds = @inbounds p * (_kdot(vv, dos, c) - deltas[c])
+            dkv = _kaccum(dkv, ds * scale, qs, c)
         end
         t += Int32(KT)
     end
 
-    active && _kstore!(dk, dkv, keep, kb, T)
+    if active
+        _kstore!(dk, live ? dkv : ntuple(Returns(zero(Float32)), Val(DIM)), one(Float32), kb, T)
+    end
 end
 
 """
     flash_bwd_dv!(dv, q, k, bias, mask, dO, lse,
-        scale, n, nouter, nh, mheads, Val(T), Val(DIM), Val(TG), Val(KT))
+        scale, n, nouter, nh, mheads, Val(T), Val(DIM), Val(TG), Val(KT), Val(HB), Val(HM))
 
 Backward pass, `dV`, one thread per KEY, streaming query tiles, the same geometry and masking
 rules as [`flash_bwd_dk!`](@ref).
@@ -213,15 +216,15 @@ rules as [`flash_bwd_dk!`](@ref).
 `dV[:, kk] = Σ_j p_{j,kk} dO_j` needs only the softmax weight `p`, never `dp` and never `delta`.
 So this kernel takes NEITHER `v` NOR `delta` as an argument, they are absent from the signature
 rather than merely unused, so nothing binds a buffer the kernel never reads, and it holds only
-`kv` plus the `dvv` accumulator: `2*DIM` registers, the same footprint as `flash_fwd!`, the one
-kernel in this file that does not spill.
+`kv` plus the `dvv` accumulator: `2*DIM` registers, the same footprint as `flash_fwd!`.
 
 That is what the split buys, and it is why `dV` rather than `dK` is the half worth separating; see
 the register-pressure note in the file header. The `s`/`p` recomputed here duplicates
 [`flash_bwd_dk!`](@ref)'s, which is pure ALU and repaid many times over by not spilling.
 """
 @kernel unsafe_indices = true function flash_bwd_dv!(dv, q, k, bias, mask, dO, lse,
-    scale, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}) where {T,DIM,TG,KT}
+    scale, n, nouter, nh, mheads, ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}, ::Val{HB},
+    ::Val{HM}) where {T,DIM,TG,KT,HB,HM}
     qs = @localmem T (DIM, KT)
     dos = @localmem T (DIM, KT)
     lses = @localmem Float32 (KT,)
@@ -247,53 +250,83 @@ the register-pressure note in the file header. The `s`/`p` recomputed here dupli
     mb = ((bh ÷ mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
     lrow = (bi * nouter + i) * nh + hi
 
-    masked = active ? unsafe_load(mask, mb + kks + Int32(1)) : true
-    # A masked key's gradient is ZERO, applied as a factor at the store rather than by skipping the
-    # loop body under `if active & !masked`. Measured: the data-dependent branch made this kernel
-    # 15-25% slower once the mask base involved the runtime `nouter` (the compiler's scheduling
-    # around it degrades), while the factor form is ~1% faster than the pre-`nouter` kernel on dense
-    # input and bit-identical. The cost moves to masked keys, which now do the arithmetic and
-    # discard it — only visible when a WHOLE SIMD group of keys is masked (long padding tails).
-    keep = (active & !masked) ? one(Float32) : zero(Float32)
+    masked = active ? (HM ? unsafe_load(mask, mb + kks + Int32(1)) : false) : true
+    live = active & !masked
 
-    kv = _kload(k, kb, Val(DIM))
+    kv = _kscale(_kload(k, kb, Val(DIM)), scale * _LOG2E)
     dvv = ntuple(Returns(zero(Float32)), Val(DIM))
 
     t = Int32(0)
     while t < n
         @synchronize
-        e = tid
-        while e <= Int32(KT) * Int32(DIM)
-            d0 = (e - Int32(1)) % Int32(DIM)
-            c0 = (e - Int32(1)) ÷ Int32(DIM)
-            jj = t + c0
-            vq = jj < n ? unsafe_load(q, qb0 + jj * hstep + d0 + Int32(1)) : zero(T)
-            vdo = jj < n ? unsafe_load(dO, qb0 + jj * hstep + d0 + Int32(1)) : zero(T)
-            @inbounds qs[d0+Int32(1), c0+Int32(1)] = vq
-            @inbounds dos[d0+Int32(1), c0+Int32(1)] = vdo
-            if d0 == Int32(0)
-                jjl = jj < n ? jj + Int32(1) : Int32(1)
-                @inbounds lses[c0+Int32(1)] = jj < n ? unsafe_load(lse, lrow * n + jjl) : zero(Float32)
-            end
-            e += Int32(TG)
-        end
+        _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid, Val(T), Val(DIM), Val(TG), Val(KT))
+        _kstage_stats!(lses, nothing, lse, nothing, lrow * n, t, n, tid, Val(TG), Val(KT))
         @synchronize
 
-        if active
-            for c in Int32(1):Int32(KT)
-                jj = t + c - Int32(1)
-                if jj < n
-                    s = _kdot(kv, qs, c) * scale +
-                        Float32(unsafe_load(bias, bh * nn + jj * n + kks + Int32(1)))
-                    p = exp(s - lses[c])
-                    dvv = _kaccum(dvv, p, dos, c)
-                end
-            end
+        for c in Int32(1):Int32(KT)
+            jj = min(t + c - Int32(1), n - Int32(1))
+            s2 = _kdot(kv, qs, c) + _kbias(bias, bh * nn + jj * n + kks + Int32(1), Val(HB))
+            p = @inbounds exp2(s2 - lses[c])
+            dvv = _kaccum(dvv, p, dos, c)
         end
         t += Int32(KT)
     end
 
-    active && _kstore!(dv, dvv, keep, kb, T)
+    if active
+        _kstore!(dv, live ? dvv : ntuple(Returns(zero(Float32)), Val(DIM)), one(Float32), kb, T)
+    end
+end
+
+"""
+    _kbias(bias, idx, Val(HB)) -> Float32
+
+One bias value, base 2 (`* log2e`), or `0` without reading `bias` when `HB = false`.
+"""
+@inline _kbias(bias, idx, ::Val{true}) = Float32(unsafe_load(bias, idx)) * _LOG2E
+@inline _kbias(bias, idx, ::Val{false}) = zero(Float32)
+
+"""
+    _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid, Val(T), Val(DIM), Val(TG), Val(KT))
+
+Stage one tile of `KT` query rows of `q` and `dO` into local memory, for the key-side kernels.
+Rows past `n` are zero-filled; their staged `lse` (see [`_kstage_stats!`](@ref)) kills them.
+"""
+@inline function _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid,
+    ::Val{T}, ::Val{DIM}, ::Val{TG}, ::Val{KT}) where {T,DIM,TG,KT}
+    e = tid
+    while e <= Int32(KT) * Int32(DIM)
+        d0 = (e - Int32(1)) % Int32(DIM)
+        c0 = (e - Int32(1)) ÷ Int32(DIM)
+        jj = t + c0
+        vq = jj < n ? unsafe_load(q, qb0 + jj * hstep + d0 + Int32(1)) : zero(T)
+        vdo = jj < n ? unsafe_load(dO, qb0 + jj * hstep + d0 + Int32(1)) : zero(T)
+        @inbounds qs[d0+Int32(1), c0+Int32(1)] = vq
+        @inbounds dos[d0+Int32(1), c0+Int32(1)] = vdo
+        e += Int32(TG)
+    end
+    return nothing
+end
+
+"""
+    _kstage_stats!(lses, deltas, lse, delta, lbase, t, n, tid, Val(TG), Val(KT))
+
+Stage one query tile's `lse` (converted to base 2) and, unless `deltas === nothing`, `delta`. A query
+past `n` gets `lse = +floatmax`, so its `p = exp2(s - floatmax)` is exactly zero.
+"""
+@inline function _kstage_stats!(lses, deltas, lse, delta, lbase, t, n, tid,
+    ::Val{TG}, ::Val{KT}) where {TG,KT}
+    e = tid
+    while e <= Int32(KT)
+        jj = t + e - Int32(1)
+        ok = jj < n
+        jl = ok ? jj : Int32(0)
+        @inbounds lses[e] = ok ? unsafe_load(lse, lbase + jl + Int32(1)) * _LOG2E : floatmax(Float32)
+        if deltas !== nothing
+            @inbounds deltas[e] = ok ? unsafe_load(delta, lbase + jl + Int32(1)) : zero(Float32)
+        end
+        e += Int32(TG)
+    end
+    return nothing
 end
 
 """
@@ -311,7 +344,7 @@ see `src/kernels/backend.jl`.
 
 Written as a FUSED reduction rather than the obvious `sum(Float32.(o) .* Float32.(dO); dims=1)`,
 because that form materialises the PRODUCT in full before reducing it away: one extra
-`[dim, n, n, bh]` buffer, 134 MB at N=512. Fusing is also ~3.4x faster, since the temporary is 
+`[dim, n, n, bh]` buffer, 134 MB at N=512. Fusing is also ~3.4x faster, since the temporary is
 never written and read back.
 
 Two details that are easy to get wrong:
@@ -337,7 +370,6 @@ function flash_bwd_delta(o::AbstractArray{T,4}, dO) where {T}
     return dropdims(r; dims=1)
 end
 
-
 """
     _atomic_fadd!(ptr, idx, val)
 
@@ -356,22 +388,17 @@ generic function is enough.
 """
 function _atomic_fadd! end
 
-"""Plain accumulate `accv += w * ks[:,c]`, no rescale: the backward never carries a running max, so
-there is nothing to correct for."""
-@inline _kaccum(accv::NTuple{D,Float32}, w, ks, c) where {D} =
-    ntuple(d -> (@inbounds accv[d] + w * Float32(ks[d, c])), Val(D))
-
 """
     kernel_signature_dq(ctx_type, PT, PL, PB, T, dim, tg, kt) -> Type
 
 Argument tuple type for ahead-of-time compilation of [`flash_bwd_dq!`](@ref), the `dQ`/`dBias`
-pass. Mirrors [`kernel_signature`](@ref)'s role for the forward; `PL` (a pointer to `Float32`) is
+pass (`dbias_t`/`bias_t` occupy the slots `dbias`/`bias` would). Mirrors [`kernel_signature`](@ref)'s role for the forward; `PL` (a pointer to `Float32`) is
 reused for both `dbias` and `lse`/`delta`, since all three are the never-narrowed accumulation type.
 """
 kernel_signature_dq(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt) where {C,PT,PL,PB,T} =
+    ::Type{T}, dim, tg, kt, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
     Tuple{C,PT,PL,PT,PT,PT,PT,PB,PT,PL,PL,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt}}
+        Val{T},Val{dim},Val{tg},Val{kt},Val{hb},Val{hm}}
 
 """
     kernel_signature_dk(ctx_type, PT, PL, PB, T, dim, tg, kt) -> Type
@@ -380,9 +407,9 @@ Argument tuple type for ahead-of-time compilation of [`flash_bwd_dk!`](@ref), th
 Takes the same operands as [`kernel_signature_dq`](@ref) but returns ONE output rather than two.
 """
 kernel_signature_dk(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt) where {C,PT,PL,PB,T} =
+    ::Type{T}, dim, tg, kt, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
     Tuple{C,PT,PT,PT,PT,PT,PB,PT,PL,PL,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt}}
+        Val{T},Val{dim},Val{tg},Val{kt},Val{hb},Val{hm}}
 
 """
     kernel_signature_dv(ctx_type, PT, PL, PB, T, dim, tg, kt) -> Type
@@ -395,6 +422,6 @@ kernel never reads would still occupy a buffer slot, and every caller's binding 
 POSITION, so a silently unused slot is a silently wrong table waiting to happen.
 """
 kernel_signature_dv(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt) where {C,PT,PL,PB,T} =
+    ::Type{T}, dim, tg, kt, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
     Tuple{C,PT,PT,PT,PT,PB,PT,PL,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt}}
+        Val{T},Val{dim},Val{tg},Val{kt},Val{hb},Val{hm}}
