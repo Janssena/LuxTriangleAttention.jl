@@ -19,6 +19,9 @@ export LayerNormNoBias
 include("layers/glu.jl")
 export GatedLinearUnit, SwiGLU
 
+include("layers/channels_last.jl")
+export ChannelsLast
+
 # Attention kernels, opted into per layer with `Attention(...; use_kernel=static(true))`. Included
 # before the layers so the kernels are in scope for the `_sdpa` dispatch.
 # `registry.jl` first: `backend.jl`'s `_ensure_variant` names `KernelEntry` in its SIGNATURE, which
