@@ -54,21 +54,33 @@ Collapsing them would silently mis-address the mask on the packed path.
 `nouter` is the outer extent the attention is batched over (`Nj` of `[hd, H, Nq, Nj, B]`). A stage
 that does not declare it was compiled for triangle attention, where it is implicitly `n`, and can
 only run square problems — see [`supports_nouter`](@ref).
+
+`bias_t` and `dbias_t` are the pair bias and its gradient TRANSPOSED — `[Nq (queries), Nk (keys), H,
+B]`, queries fastest, where `bias` is keys fastest. A kernel with one thread per query reads a
+queries-fastest bias coalesced; the built-in kernel's `:fwd` and `:dq` stages use them (see
+`FLASH_ROLES`). The launcher builds `bias_t` from the caller's `bias` and transposes `dbias_t` back,
+so the caller only ever sees `bias`/`dbias`. Each shares its RANK with its untransposed twin: it
+occupies the same slot, and a stage may declare one or the other, never both (checked by
+[`_validate_stages`](@ref)).
 """
 const _ROLE_RANK = Dict{Symbol,Int}(
     # outputs
     :o => 100, :lse => 101, :delta => 102,
-    :dq => 110, :dk => 111, :dv => 112, :dbias => 113,
+    :dq => 110, :dk => 111, :dv => 112, :dbias => 113, :dbias_t => 113,
     # inputs
-    :q => 200, :k => 201, :v => 202, :bias => 203, :mask => 204,
+    :q => 200, :k => 201, :v => 202, :bias => 203, :bias_t => 203, :mask => 204,
     :dO => 205, :o_in => 206, :lse_in => 207, :delta_in => 208,
     # scalars
     :scale => 300, :neg_inf => 301, :n => 302, :nouter => 303, :nh => 304, :mheads => 305,
     :h => 306, :dim => 307,
 )
 
-const _OUTPUT_ROLES = Set([:o, :lse, :delta, :dq, :dk, :dv, :dbias])
-const _INPUT_ROLES = Set([:q, :k, :v, :bias, :mask, :o_in, :lse_in, :delta_in, :dO])
+const _OUTPUT_ROLES = Set([:o, :lse, :delta, :dq, :dk, :dv, :dbias, :dbias_t])
+const _INPUT_ROLES = Set([:q, :k, :v, :bias, :bias_t, :mask, :o_in, :lse_in, :delta_in, :dO])
+
+# A role and its transposed twin share a rank, so one stage declaring both would make the buffer
+# order ambiguous. See `_ROLE_RANK`.
+const _TWIN_ROLES = ((:bias, :bias_t), (:dbias, :dbias_t))
 const _SCALAR_ROLES = Set([:scale, :neg_inf, :n, :nouter, :nh, :mheads, :h, :dim])
 
 """
@@ -172,8 +184,11 @@ One registered kernel implementation: every stage, and everything needed to laun
 - `layout`: the axis order the binaries were compiled for, e.g. `(:hd, :H, :Nq, :Nj, :B)` for ours
   or `(:bh, :n, :n, :dim)` for trifast. The launcher permutes into it.
 - `rowmajor`: whether `layout` is written fastest-axis-last.
-- `keys`: which of `(:dtype, :dim, :nbucket)` the binaries vary over. Ours is `(:dtype, :dim,
-  :nbucket)`; a kernel that takes `n` as a runtime argument omits `:nbucket`.
+- `keys`: which of `(:dtype, :dim, :nbucket, :obucket, :hbucket)` the variants vary over. A kernel
+  that takes `n` as a runtime argument omits `:nbucket`. `:obucket` (`nbucket(nouter)`) and
+  `:hbucket` (`nbucket(heads · batch)`, or `0` for "any") key a variant on the attention's GEOMETRY:
+  ours carries all five, because its best configuration depends on how many threads a call launches
+  (`n · nouter · heads · batch`), not only on `n` (see [`tune_flash_kernel!`](@ref)).
 - `variants`: key tuple → ordered stages. One entry can hold many compiled configurations.
 - `preamble`: leading `:bytes` slots, declared per entry. Exists only for our KernelAbstractions
   kernel's `(kernel_state, KA_context)` prefix; empty for everyone else.
@@ -322,15 +337,20 @@ The `kfields` method exists for [`register_kernel!`](@ref), which needs the key 
 entry to ask: the key is what makes a stage's [`stage_id`](@ref), and that names the file the binary
 is copied to.
 """
-variant_key(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer) where {T} =
-    variant_key(entry.keys, T, dim, n)
+variant_key(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer; nouter::Integer=n,
+    heads::Integer=0) where {T} = variant_key(entry.keys, T, dim, n; nouter, heads)
 
-function variant_key(kfields::Vector{Symbol}, ::Type{T}, dim::Integer, n::Integer) where {T}
+# `heads = 0` is the wildcard: a variant tuned without a geometry (the triangle-shaped calibration)
+# is keyed `hbucket = 0`, and serves any head count that has no exact variant.
+function variant_key(kfields::Vector{Symbol}, ::Type{T}, dim::Integer, n::Integer;
+    nouter::Integer=n, heads::Integer=0) where {T}
     vals = Any[]
     for f in kfields
         f === :dtype && push!(vals, nameof(T))
         f === :dim && push!(vals, Int(dim))
         f === :nbucket && push!(vals, nbucket(n))
+        f === :obucket && push!(vals, nbucket(nouter))
+        f === :hbucket && push!(vals, heads == 0 ? 0 : nbucket(heads))
     end
     return Tuple(vals)
 end
@@ -340,30 +360,43 @@ end
 
 The compiled stages for one problem, or `nothing` if this entry has none.
 
-An exact key match wins. Failing that, `:nbucket` alone is allowed to fall back — to the smallest
-registered bucket ABOVE the requested one, then the largest below — because a kernel compiled for a
-longer sequence still computes a shorter one correctly (it is a compile-time upper bound, not an
-assumption), whereas a wrong `dtype` or `dim` is a different ABI and must never be substituted.
+An exact key match wins. Failing that, only the SIZE fields may fall back, never `dtype` or `dim`
+(a different ABI, which must never be substituted). Among variants with the right `dtype` and
+`dim`, the pick is the closest geometry first, then the closest length:
+1. `:obucket` and `:hbucket` by distance in powers of two, with a wildcard `hbucket = 0` ranked just
+   behind an exact head-count match;
+2. `:nbucket` as before: the smallest bucket ABOVE the requested one, then the largest below,
+   because a kernel compiled for a longer sequence still computes a shorter one correctly (it is a
+   compile-time upper bound, not an assumption).
+
+`nouter` and `heads` (`heads · batch`, the number of `(head, batch)` slices) describe the call; an
+entry without geometry keys ignores them.
 
 `nothing` is a real answer, not an error: it is what triggers a lazy tune for `:default`, and a
 clear "compile this configuration first" for anything else.
 """
-function resolve_variant(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer) where {T}
-    key = variant_key(entry, T, dim, n)
+function resolve_variant(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer;
+    nouter::Integer=n, heads::Integer=0) where {T}
+    key = variant_key(entry, T, dim, n; nouter, heads)
     haskey(entry.variants, key) && return entry.variants[key]
 
-    idx = findfirst(==(:nbucket), entry.keys)
-    idx === nothing && return nothing
-
-    want = key[idx]
-    others(k) = (k[1:idx-1]..., k[idx+1:end]...)
-    rest = others(key)
-    cands = [k for k in keys(entry.variants) if others(k) == rest]
+    size_fields = (:nbucket, :obucket, :hbucket)
+    fixed = [i for (i, f) in enumerate(entry.keys) if !(f in size_fields)]
+    cands = [k for k in keys(entry.variants) if all(k[i] == key[i] for i in fixed)]
     isempty(cands) && return nothing
 
-    above = filter(k -> k[idx] >= want, cands)
-    pick = isempty(above) ? argmax(k -> k[idx], cands) : argmin(k -> k[idx], above)
-    return entry.variants[pick]
+    ix(f) = findfirst(==(f), entry.keys)
+    io, ih, in_ = ix(:obucket), ix(:hbucket), ix(:nbucket)
+    l2(x) = log2(max(x, 1))
+    function score(k)
+        od = io === nothing ? 0.0 : abs(l2(k[io]) - l2(key[io]))
+        hd = ih === nothing ? 0.0 : (key[ih] == k[ih] ? 0.0 : k[ih] == 0 ? 0.5 : 1.0 + abs(l2(k[ih]) - l2(key[ih])))
+        # Length: a bucket at or above the request first (smallest such), then the largest below.
+        nd = in_ === nothing ? 0.0 :
+             k[in_] >= key[in_] ? l2(k[in_]) - l2(key[in_]) : 1000.0 + l2(key[in_]) - l2(k[in_])
+        return (od + hd, nd)
+    end
+    return entry.variants[argmin(score, cands)]
 end
 
 kernel_registry_dir() = joinpath(kernel_cache_root(), "kernels")
@@ -460,14 +493,21 @@ function _validate_stages(stages::Vector{KernelStage})
             join([":$g" for g in _GRID_AXES], ", ")))
         s.threadgroup > 0 || throw(ArgumentError(
             "stage `:$(s.name)` has threadgroup $(s.threadgroup); must be positive"))
+        for (a, b) in _TWIN_ROLES
+            roles = (s.outputs..., s.inputs...)
+            (a in roles && b in roles) && throw(ArgumentError(
+                "stage `:$(s.name)` declares both `:$a` and `:$b`; they occupy the same slot, " *
+                "declare one"))
+        end
     end
 
     # Each gradient written exactly once. Twice means one launch silently overwrites the other;
-    # zero means that gradient is whatever the freshly-allocated buffer happened to hold.
+    # zero means that gradient is whatever the freshly-allocated buffer happened to hold. `dbias_t`
+    # IS `dbias`, transposed, so either counts.
     bwd = filter(s -> s.name !== :fwd, stages)
     if !isempty(bwd)
         for g in (:dq, :dk, :dv, :dbias)
-            n = count(s -> g in s.outputs, bwd)
+            n = count(s -> g in s.outputs || (g === :dbias && :dbias_t in s.outputs), bwd)
             n == 1 || throw(ArgumentError(
                 "`:$g` is written by $n backward stages; it must be written by exactly one. " *
                 "Stages: " * join(["`:$(s.name)` -> $(s.outputs)" for s in bwd], ", ")))
@@ -597,7 +637,7 @@ end
 # The unreserved half of `register_kernel!`, so `tune_flash_kernel!` can write `:default` without
 # being able to reach it from user code.
 function _register!(name::Symbol; fwd, dq, dk, dv, stages, dim, dtype, n,
-    layout, rowmajor, threadgroup, grid, preamble, description)
+    layout, rowmajor, threadgroup, grid, preamble, description, nouter=nothing, heads=nothing)
 
     srcs = Pair{Symbol,String}[]
     specs = Dict{Symbol,Any}()
@@ -629,9 +669,13 @@ function _register!(name::Symbol; fwd, dq, dk, dv, stages, dim, dtype, n,
 
     kfields = Symbol[:dtype, :dim]
     n === nothing || push!(kfields, :nbucket)
+    # Geometry keys: only `tune_flash_kernel!` passes them (see `KernelEntry`'s `keys`).
+    nouter === nothing || push!(kfields, :obucket)
+    heads === nothing || push!(kfields, :hbucket)
     # The key is needed HERE, before anything is copied: it is half of each stage's `stage_id`, and
     # that is what keeps one variant's binaries off another's.
-    key = variant_key(kfields, dtype, dim, something(n, 1))
+    key = variant_key(kfields, dtype, dim, something(n, 1);
+        nouter=something(nouter, something(n, 1)), heads=something(heads, 0))
 
     dir = entry_dir(name)
     mkpath(dir)
@@ -653,6 +697,9 @@ function _register!(name::Symbol; fwd, dq, dk, dv, stages, dim, dtype, n,
     _validate_stages(built)
 
     prev = get(_KERNELS, name, nothing)
+    # A `:default` manifest from before the geometry keys existed is keyed differently. It is ours
+    # and always rebuildable, so it is replaced rather than refused (its binaries are pruned below).
+    (prev !== nothing && name === RESERVED_KERNEL_NAME && prev.keys != kfields) && (prev = nothing)
     entry = if prev === nothing
         KernelEntry(name, backend, format, collect(Symbol.(layout)), rowmajor,
             kfields, Dict{Tuple,Vector{KernelStage}}(), collect(Symbol.(preamble)),

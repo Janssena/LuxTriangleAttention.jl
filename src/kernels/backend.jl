@@ -117,14 +117,21 @@ configuration error, and silently running host attention on it would hide a 10-1
 a correct answer.
 """
 function _sdpa_kernel(be::GPUBackend, q, k, v, mask, bias)
+    q, k, v, mask, bias = map(x -> device_dense(be, x), (q, k, v, mask, bias))
     entry = kernel_entry()
     entry.backend === backend_symbol(be) || throw(ArgumentError(
         "the selected kernel `:$(entry.name)` is a `:$(entry.backend)` kernel, but these arrays " *
         "are on `:$(backend_symbol(be))`. Call `use_kernel!` with a kernel for this device."))
     T = _realtype(eltype(q))
     dim, n = size(q, 1), size(q, 3)
-    stages = resolve_variant(entry, T, dim, n)
-    stages === nothing && (stages = _ensure_variant(entry, T, dim, n))
+    # The call's geometry, for per-layer tuned variants: `[hd, H, Nq, B]` is a plain sequence
+    # (outer extent 1), `[hd, H, Nq, Nj, B]` has `Nj` outer slices; `heads` counts every
+    # `(head, batch)` slice.
+    nouter = ndims(q) == 5 ? size(q, 4) : 1
+    heads = size(q, 2) * size(q, ndims(q))
+    stages = resolve_variant(entry, T, dim, n; nouter, heads)
+    stages === nothing && (stages = _ensure_variant(entry, T, dim, n; nouter, heads))
+    stages = specialise_stages(entry, stages, T, dim, bias !== nothing, mask !== nothing)
     ndims(q) == 4 || return _sdpa_kernel_launch(be, entry, stages, q, k, v, mask, bias)
     o, lse = _sdpa_kernel_launch(be, entry, stages, _seq5(q), _seq5(k), _seq5(v), mask, bias)
     return reshape(o, size(q)), reshape(lse, 1, size(q, 3), size(q, 2), size(q, 4))
@@ -174,7 +181,8 @@ to build it, and a fresh install should just work. It costs seconds, once, and s
 For any other entry there is nothing to build: those binaries came from the user, so the only
 correct response is to say which configuration is missing.
 """
-function _ensure_variant(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer) where {T}
+function _ensure_variant(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer;
+    nouter::Integer=n, heads::Integer=0) where {T}
     if entry.name === RESERVED_KERNEL_NAME
         _tracing() && throw(ErrorException(
             "no compiled `:$RESERVED_KERNEL_NAME` kernel for (T=$T, dim=$dim, n=$n), and it " *
@@ -183,7 +191,7 @@ function _ensure_variant(entry::KernelEntry, ::Type{T}, dim::Integer, n::Integer
         @info "Tuning the built-in flash kernel for n=$n, dim=$dim, T=$T. " *
               "This runs once and is cached; call `tune_flash_kernel!` ahead of time to avoid it here."
         tune_flash_kernel!(n; dim, T)
-        stages = resolve_variant(kernel_entry(RESERVED_KERNEL_NAME), T, dim, n)
+        stages = resolve_variant(kernel_entry(RESERVED_KERNEL_NAME), T, dim, n; nouter, heads)
         stages === nothing && error("tuning `:$RESERVED_KERNEL_NAME` produced no usable variant")
         return stages
     end
