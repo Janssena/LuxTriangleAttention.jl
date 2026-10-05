@@ -66,7 +66,9 @@ function (m::ChannelsLast{<:Lux.LayerNorm})(x::AbstractArray{T,N}, ps, st) where
     pshape = (ntuple(Returns(1), N - 1)..., size(x, N))
     scale = haskey(ps, :scale) ? reshape(ps.scale, pshape) : nothing
     bias = haskey(ps, :bias) ? reshape(ps.bias, pshape) : nothing
-    return Lux.LuxLib.layernorm(x, scale, bias, ln.activation, N, ln.epsilon), st
+    # Uses `Lux.Utils.eltype`, not `T`: under Reactant `T` is a `TracedRNumber`.
+    eps = convert(Lux.Utils.eltype(x), ln.epsilon)
+    return Lux.LuxLib.layernorm(x, scale, bias, ln.activation, N, eps), st
 end
 
 function (m::ChannelsLast{<:GatedLinearUnit{True}})(x::AbstractArray{T,N}, ps, st) where {T,N}
