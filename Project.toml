@@ -4,27 +4,30 @@ version = "0.4.0"
 authors = ["Janssena <alexanderjanssen@live.com>"]
 
 [deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+KernelDispatch = "8d34074f-262e-46e2-9f95-b1abcc740b38"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+Preferences = "21216c6a-2e73-6563-6e65-726566657250"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Static = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [weakdeps]
-Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [extensions]
-LuxTriangleAttentionEnzymeExt = "Enzyme"
 LuxTriangleAttentionMetalExt = "Metal"
 LuxTriangleAttentionReactantExt = "Reactant"
 
 [compat]
-Enzyme = "0.13"
+BFloat16s = "0.5, 0.6"
 KernelAbstractions = "0.9"
+KernelDispatch = "0.2"
 Lux = "1.31.4"
 Metal = "1.10"
+Preferences = "1.4"
 Random = "1.11.0"
 Reactant = "0.2.279"
 Static = "1.3.1"
