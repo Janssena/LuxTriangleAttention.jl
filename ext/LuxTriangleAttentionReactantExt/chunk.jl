@@ -1,9 +1,9 @@
-# The rolled `@trace` chunking path: `_sdpa_stable`'s traced implementation, the compile options and
+# The rolled `@trace` chunking path: `_sdpa_enzyme_safe`'s traced implementation, the compile options and
 # `@code_hlo` check that keep the rolled loop from being optimized away, and `_chunked_sdpa`
 # itself. Everything here exists only to bound the REVERSE pass's memory (see the base package's
 # `layers/chunk.jl` and `Attention`'s `chunk_size` docs for the forward-side motivation).
 #
-# `_sdpa_stable` and `_stopgrad` are LOCAL to this extension, not methods of a base-package function:
+# `_sdpa_enzyme_safe` and `_stopgrad` are LOCAL to this extension, not methods of a base-package function:
 # nothing in `src/` ever calls either one — the rolled loop below is their only caller, and it lives
 # in this same file. Giving them base-package stub methods (an earlier version of this file did)
 # bought nothing, since a stub nothing calls is not an extension point; it just split one concept's
@@ -16,9 +16,10 @@
 _stopgrad(x) = Reactant.EnzymeCore.ignore_derivatives(x)
 
 """
-    _sdpa_stable(q::AnyTracedRArray, k, v, mask, bias)
+    _sdpa_enzyme_safe(q::AnyTracedRArray, k, v, mask, bias)
 
-Traced scaled-dot-product attention: a SHADOW COPY of LuxLib's
+Traced scaled-dot-product attention that Enzyme can differentiate inside the rolled `stablehlo.while`
+loop (hence the name; it is no more numerically stable than `_sdpa_default`). A SHADOW COPY of LuxLib's
 `ext/ReactantExt/attention.jl::Impl.unsafe_scaled_dot_product_attention`, with one change — the
 softmax's max-reduce is wrapped in `ignore_derivatives`.
 
@@ -38,7 +39,24 @@ function should be deleted and the rolled path pointed back at `_sdpa_default` d
 caught rather than silent: the chunking tests compare this against the unchunked `_sdpa` layer, so
 if LuxLib's conventions move, they go red.
 """
-function _sdpa_stable(q::AnyTracedRArray{TQ,N}, k, v, mask, bias) where {TQ,N}
+_sdpa_enzyme_safe(q::AnyTracedRArray, k, v, mask, bias) =
+    LuxTriangleAttention._with_dead_rows(_sdpa_enzyme_safe_raw, q, k, v, mask, bias)
+
+# `_sdpa_enzyme_safe` minus the fully-masked-key-set rule, which `_with_dead_rows` adds around it.
+#
+# Float16 runs in Float32. The compiler is free to move the `1/√d` multiply from `q` to after `Q·Kᵀ`
+# (legal in exact arithmetic), and then the UNSCALED logits must fit Float16: they reach 9e4 on Boltz2's
+# activations, past `floatmax(Float16) = 65504`, which overflows to `Inf` and a NaN row. Widening `q`, `k`,
+# `v` and the bias costs little here: this path only ever holds one chunk's scores
+# (`chunk_size · N² · H`), which is the point of chunking. The result is narrowed back. Each cast is its
+# OWN broadcast, so it lowers to one whole-array convert.
+function _sdpa_enzyme_safe_raw(q::AnyTracedRArray{TQ,N}, k, v, mask, bias) where {TQ,N}
+    Reactant.unwrapped_eltype(TQ) === Float16 || return _sdpa_enzyme_safe_core(q, k, v, mask, bias)
+    wide(x) = isnothing(x) ? nothing : Float32.(x)
+    return Float16.(_sdpa_enzyme_safe_core(Float32.(q), wide(k), wide(v), mask, wide(bias)))
+end
+
+function _sdpa_enzyme_safe_core(q::AnyTracedRArray{TQ,N}, k, v, mask, bias) where {TQ,N}
     mat = Reactant.TracedUtils.materialize_traced_array
     q, k, v = mat(q), mat(k), mat(v)
     head_dim, token_dim, num_heads_dim = 1, 3, 2
@@ -61,17 +79,17 @@ function _sdpa_stable(q::AnyTracedRArray{TQ,N}, k, v, mask, bias) where {TQ,N}
     # (LuxLib 1.15.9 hardcodes `[N, N-1]`, which is this rule for a matrix; later versions
     # generalise it exactly this way.)
     _rev_dims(x) = collect(Int, N:-1:(N - ndims(x) + 1))
-    if bias !== nothing
+    if !isnothing(bias)
         b = mat(bias)
         alpha = Reactant.@opcall add(
             alpha, Reactant.@opcall(broadcast_in_dim(b, _rev_dims(b), collect(Int, size(alpha)))))
     end
-    if mask !== nothing
+    if !isnothing(mask)
         m = mat(mask)
         alpha = Reactant.@opcall select(
             Reactant.@opcall(broadcast_in_dim(m, _rev_dims(m), collect(Int, size(alpha)))),
             alpha,
-            Reactant.@opcall(fill(typemin(eltype(alpha)), size(alpha))))
+            Reactant.@opcall(fill(LuxTriangleAttention.mask_value(T), size(alpha))))
     end
 
     # Softmax over the key axis (last, in this ordering). THE ONE CHANGE: the max is a constant
@@ -221,7 +239,7 @@ function LuxTriangleAttention._chunked_sdpa(
     fill!(out, zero(eltype(qc)))
 
     @trace checkpointing = true for c in 1:nchunks
-        out[_chunk_index(out, c)...] = _sdpa_stable(
+        out[_chunk_index(out, c)...] = _sdpa_enzyme_safe(
             qc[_chunk_index(qc, c)...], kc[_chunk_index(kc, c)...], vc[_chunk_index(vc, c)...],
             _take_chunk(mc, c, m_tag), _take_chunk(bc, c, b_tag))
     end
