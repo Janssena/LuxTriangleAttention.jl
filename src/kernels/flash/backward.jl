@@ -141,7 +141,8 @@ Holds `kv`, `vv` and the `dkv` accumulator, `3*DIM` registers, the same footprin
 `dK` alone needs `dp = v·dO` in order to form `ds`. That asymmetry is the entire reason the two are
 separate kernels rather than one: see the register-pressure note in the file header.
 
-A masked key contributes nothing at any query (in the forward, `p = 0` there for every column), so
+A masked key contributes nothing at any query of a slice that has a live key (in the forward, `p = 0` there for
+every column; a slice with none attended uniformly, and `dV` gives every key its share, see `flash_bwd_dv!`), so
 `dK` is written as ZERO for it — selected at the store, not multiplied in, so a non-finite
 accumulator (a fully-masked row's `lse = -Inf`) cannot leak through as `0 * Inf = NaN` — and never
 by an early return, since every thread in a group must still take part in the cooperative staging
@@ -256,24 +257,43 @@ the register-pressure note in the file header. The `s`/`p` recomputed here dupli
     kv = _kscale(_kload(k, kb, Val(DIM)), scale * _LOG2E)
     dvv = ntuple(Returns(zero(Float32)), Val(DIM))
 
-    t = Int32(0)
-    while t < n
-        @synchronize
-        _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid, Val(T), Val(DIM), Val(TG), Val(KT))
-        _kstage_stats!(lses, nothing, lse, nothing, lrow * n, t, n, tid, Val(TG), Val(KT))
-        @synchronize
+    # A FULLY MASKED slice (`flash_fwd!` wrote `lse = -Inf` for every query of it) attended uniformly, so
+    # `dV[kk] = Σⱼ dO[j] / n` for EVERY key, masked or not. One `lse` load tells, the same for every thread
+    # of the group, and the branch is taken once, outside the tile loop: a live slice runs the loop below
+    # unchanged. (Only the whole slice is dead this way; a single query row made all-`-Inf` by its bias is not.)
+    dead_slice = unsafe_load(lse, lrow * n + Int32(1)) == -Inf32
 
-        for c in Int32(1):Int32(KT)
-            jj = min(t + c - Int32(1), n - Int32(1))
-            s2 = _kdot(kv, qs, c) + _kbias(bias, bh * nn + jj * n + kks + Int32(1), Val(HB))
-            p = @inbounds exp2(s2 - lses[c])
-            dvv = _kaccum(dvv, p, dos, c)
+    t = Int32(0)
+    if dead_slice
+        invn = inv(Float32(n))
+        while t < n
+            @synchronize
+            _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid, Val(T), Val(DIM), Val(TG), Val(KT))
+            @synchronize
+            for c in Int32(1):Int32(KT)
+                dvv = _kaccum(dvv, invn, dos, c)
+            end
+            t += Int32(KT)
         end
-        t += Int32(KT)
+    else
+        while t < n
+            @synchronize
+            _kstage_rows!(qs, dos, q, dO, qb0, hstep, t, n, tid, Val(T), Val(DIM), Val(TG), Val(KT))
+            _kstage_stats!(lses, nothing, lse, nothing, lrow * n, t, n, tid, Val(TG), Val(KT))
+            @synchronize
+
+            for c in Int32(1):Int32(KT)
+                jj = min(t + c - Int32(1), n - Int32(1))
+                s2 = _kdot(kv, qs, c) + _kbias(bias, bh * nn + jj * n + kks + Int32(1), Val(HB))
+                p = @inbounds exp2(s2 - lses[c])
+                dvv = _kaccum(dvv, p, dos, c)
+            end
+            t += Int32(KT)
+        end
     end
 
     if active
-        _kstore!(dv, live ? dvv : ntuple(Returns(zero(Float32)), Val(DIM)), one(Float32), kb, T)
+        _kstore!(dv, (live | dead_slice) ? dvv : ntuple(Returns(zero(Float32)), Val(DIM)), one(Float32), kb, T)
     end
 end
 
@@ -339,8 +359,8 @@ makes `dS = p * (dP - delta)` correct; see e.g. the FlashAttention-2 paper).
 Ordinary broadcasting, not a `@kernel`: the RESULT costs nothing extra to materialise (it is exactly
 the shape of `o`/`dO` reduced over one axis already the same size as `lse`), so a raw-pointer kernel
 buys nothing here. Works on any array backend — CPU, `MtlArray`, whatever `q`/`k`/`v` already are,
-for the same reason `_sdpa_kernel`'s CPU fallback needs no device-specific kernel of its own either,
-see `src/kernels/backend.jl`.
+for the same reason `SDPA()`'s CPU fallback needs no device-specific kernel of its own either,
+see `src/kernels/sdpa_op.jl`.
 
 Written as a FUSED reduction rather than the obvious `sum(Float32.(o) .* Float32.(dO); dims=1)`,
 because that form materialises the PRODUCT in full before reducing it away: one extra
@@ -380,48 +400,7 @@ Declared here with no implementation. An atomic add has no portable expression o
 `KernelAbstractions`'s raw-pointer kernels (see note 2 in `forward.jl` for why raw pointers are used
 at all), so a backend extension supplies the actual instruction for its own pointer type, e.g. the
 Metal extension adds a method for `LLVMPtr{Float32,AS.Device}` built on
-`Metal.atomic_fetch_add_explicit`. This is ordinary dispatch on a function this package owns, not
-the `Ref`-based seam `device.jl` uses for `_DEVICE_BINARY`/`_KA_BACKEND_OBJECT`: those exist because
-the Reactant extension needs something the Metal extension defines and cannot import it directly,
-but here only ONE extension (whichever backend is loaded) ever needs to supply a method, so a plain
-generic function is enough.
+`Metal.atomic_fetch_add_explicit`: ordinary dispatch on a function this package owns, like the
+backend hooks in `device.jl`.
 """
 function _atomic_fadd! end
-
-"""
-    kernel_signature_dq(ctx_type, PT, PL, PB, T, dim, tg, kt) -> Type
-
-Argument tuple type for ahead-of-time compilation of [`flash_bwd_dq!`](@ref), the `dQ`/`dBias`
-pass (`dbias_t`/`bias_t` occupy the slots `dbias`/`bias` would). Mirrors [`kernel_signature`](@ref)'s role for the forward; `PL` (a pointer to `Float32`) is
-reused for both `dbias` and `lse`/`delta`, since all three are the never-narrowed accumulation type.
-"""
-kernel_signature_dq(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
-    Tuple{C,PT,PL,PT,PT,PT,PT,PB,PT,PL,PL,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt},Val{hb},Val{hm}}
-
-"""
-    kernel_signature_dk(ctx_type, PT, PL, PB, T, dim, tg, kt) -> Type
-
-Argument tuple type for ahead-of-time compilation of [`flash_bwd_dk!`](@ref), the `dK` pass.
-Takes the same operands as [`kernel_signature_dq`](@ref) but returns ONE output rather than two.
-"""
-kernel_signature_dk(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
-    Tuple{C,PT,PT,PT,PT,PT,PB,PT,PL,PL,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt},Val{hb},Val{hm}}
-
-"""
-    kernel_signature_dv(ctx_type, PT, PL, PB, T, dim, tg, kt) -> Type
-
-Argument tuple type for ahead-of-time compilation of [`flash_bwd_dv!`](@ref), the `dV` pass.
-
-Shorter than the others by two pointers: `dV` needs neither `v` nor `delta` (see that kernel's
-docstring), and they are omitted from the signature rather than passed and ignored, an argument the
-kernel never reads would still occupy a buffer slot, and every caller's binding table is built by
-POSITION, so a silently unused slot is a silently wrong table waiting to happen.
-"""
-kernel_signature_dv(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
-    Tuple{C,PT,PT,PT,PT,PB,PT,PL,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt},Val{hb},Val{hm}}

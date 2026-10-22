@@ -1,56 +1,91 @@
+# What the built-in kernels need from a device backend, as methods on KernelDispatch' backend tags. A
+# backend extension (Metal: `ext/LuxTriangleAttentionMetalExt.jl`) adds them for its own tag;
+# everything else — building, launching, verifying, timing, tuning — is backend-agnostic code in
+# `launch.jl` and `tune.jl`, on KernelDispatch' public API.
+
 """
     device_kernel_available() -> Bool
 
-Whether a backend extension is loaded AND its device is usable. False on a host-only setup.
+Whether a backend extension is loaded AND its device is usable (`KernelDispatch.device_available()`).
+False on a host-only setup.
 """
-device_kernel_available() = _DEVICE_AVAILABLE[]()
-
-const _DEVICE_AVAILABLE = Ref{Function}(() -> false)
-
-"""
-    _DEVICE_BINARY[]
-
-`(T, dim, tg, kt) -> (path, entry)`, installed by a backend extension.
-
-This exists because the Reactant extension has to name a compiled binary in the `custom_call` it
-emits, but it cannot ask the backend extension directly. Julia has no mechanism for one extension
-to import another, and here neither is even guaranteed to be loaded. Routing through a `Ref` owned
-by the package keeps both extensions depending only on `LuxTriangleAttention`.
-
-Returns the cached binary or builds it. Left as the throwing default when no backend is loaded, so
-a caller that needs it fails with a clear message instead of emitting a call to a file that does not
-exist.
-"""
-const _DEVICE_BINARY = Ref{Function}((args...) ->
-    error("no backend extension is loaded; cannot locate a compiled kernel"))
+device_kernel_available() = KernelDispatch.device_available()
 
 """
-    _KA_BACKEND_OBJECT[]
+    DeviceCaps
 
-`() -> KernelAbstractions.Backend`, installed by a backend extension.
+What a backend reports for the candidate configurations to be built. Deliberately small: anything
+that can be measured is measured rather than declared.
 
-`KernelAbstractions.mkcontext` needs a concrete KernelAbstractions backend object (`MetalBackend()`, `CUDABackend()`
-…), which only the extension that depends on that vendor package can construct. Our `KernelBackend`
-tags deliberately cannot: they are a routing trait, not a handle.
+# Fields
+- `warp`: threads per warp / wavefront / SIMD group. Group sizes are multiples of this.
+- `max_threads`: the device's ceiling on threads per group. A NECESSARY but not sufficient bound —
+  a compiled pipeline's own limit (`KernelDispatch.max_threads`) is checked per candidate.
+- `max_shmem`: bytes of local memory available to one group.
+- `name`: device identifier, used as the calibration key.
 """
-const _KA_BACKEND_OBJECT = Ref{Function}(() ->
-    error("no backend extension is loaded; cannot construct a KernelAbstractions backend"))
+struct DeviceCaps
+    warp::Int
+    max_threads::Int
+    max_shmem::Int
+    name::String
+end
+
+"""
+    device_caps(backend) -> DeviceCaps
+
+The device's limits. Implemented by the backend extension for its own tag.
+"""
+device_caps(be::KernelDispatch.KernelBackend) = throw(ArgumentError(
+    "no device capabilities for $(typeof(be)); load the package for that backend"))
+
+"""
+    to_device(backend, x::Array) -> device array
+
+`x` copied to the backend's device. Implemented by the backend extension; the tuner's probe and
+verification problems are built on the host and moved with it.
+"""
+to_device(be::KernelDispatch.KernelBackend, x) = throw(ArgumentError(
+    "no device arrays for $(typeof(be)); load the package for that backend"))
+
+"""
+    supported_eltypes() -> Tuple{Vararg{DataType}}
+
+Storage element types the built-in kernels will run.
+
+The kernels are written generically over the storage type (accumulation is always `Float32` — see
+note 3 in `src/kernels/flash/forward.jl`). A dtype is listed only after the reference comparison has
+run at it: a path that has only ever been executed at `Float32` is untested, not working. `Float16` and
+`BFloat16` (BFloat16s.jl's, the type Metal.jl and Reactant use) are checked against the reference on
+upcast inputs, on the eager and traced paths (`test/ext/metal/launch.test.jl`,
+`test/ext/reactant/attention_kernel.test.jl`). They are the precisions KernelDispatch 0.2 supports
+(eagerly, from a trace, and in launches that mix them), and its signature check refuses a launch whose
+buffers are not of the type the binary was compiled for.
+"""
+supported_eltypes() = (Float32, Float16, BFloat16)
+
+function _check_eltype(::Type{T}) where {T}
+    T in supported_eltypes() && return nothing
+    throw(ArgumentError(
+        "storage eltype $T is not enabled for the device attention kernels (enabled: " *
+        "$(join(supported_eltypes(), ", "))). The kernels are generic over storage precision and " *
+        "$T may well compile, but it has not been validated against the reference — see " *
+        "`supported_eltypes`."))
+end
 
 """
     kernel_source_tag() -> String
 
 Short hash of the kernel sources, for a backend to put in its binary cache key.
 
-The cache key that matters — `(T, dim, tg, kt)` — says what a binary was compiled FOR, not what it
-was compiled FROM. Without this, editing `flash/forward.jl` leaves every previously built binary on disk
-under a key that still matches, so the next run silently launches the OLD kernel: no error, no
-recompile, and results that quietly belong to code that no longer exists. Only the numbers move,
-which makes it a genuinely nasty way to lose an afternoon.
+The cache key that matters — the stage, `T`, `dim` and the tuned parameters — says what a binary
+was compiled FOR, not what it was compiled FROM. Without this, editing `flash/forward.jl` leaves every
+previously built binary on disk under a key that still matches, so the next run silently launches
+the OLD kernel: no error, no recompile, and results that quietly belong to code that no longer exists.
 
 Computed once, when the package is precompiled, over the kernel source files — so it tracks the code
 actually baked into the loaded image. It does NOT cover the toolchain (Julia, GPUCompiler,
-KernelAbstractions, or the backend's own compiler), which can also change codegen; a backend that
-wants to be strict about that should mix its own versions in on top.
+KernelAbstractions, or the backend's own compiler), which can also change codegen.
 """
 kernel_source_tag() = KERNEL_SOURCE_TAG
 
@@ -60,78 +95,3 @@ const KERNEL_SOURCE_TAG = let h = UInt64(0)
     end
     string(h % UInt32; base=36)
 end
-
-"""
-    device_binary(T, dim, tg, kt) -> (path, entry)
-
-Path and entry-point name of the compiled kernel for one configuration, building it if absent.
-"""
-device_binary(::Type{T}, dim::Integer, tg::Integer, kt::Integer) where {T} =
-    _DEVICE_BINARY[](T, Int(dim), Int(tg), Int(kt))
-
-"""
-    _DEVICE_BINARY_BWD[]
-
-`(T, dim, tg, kt) -> (; dq, dk, dv)`, each a `(path, entry)` pair, installed by a backend extension.
-
-The backward analogue of [`_DEVICE_BINARY`](@ref): `tune_flash_kernel!` and the traced backward
-walk (`flash_bwd_dq!`/`flash_bwd_dk!`/`flash_bwd_dv!` in `flash/backward.jl`) both need to name THREE
-compiled binaries — one per backward pass — and cannot reach the backend extension that compiled
-them directly, for the same reason `_DEVICE_BINARY` cannot. Left as the throwing default when no
-backend is loaded, so a caller that needs it fails loudly rather than naming a file that does not
-exist.
-"""
-const _DEVICE_BINARY_BWD = Ref{Function}((args...) ->
-    error("no backend extension is loaded; cannot locate compiled backward kernels"))
-
-"""
-    device_binary_bwd(T, dim, tg, kt) -> (; dq, dk, dv)
-
-Paths and entry-point names of the compiled backward kernels for one configuration, building them if
-absent. Each field is a `(path, entry)` pair.
-"""
-device_binary_bwd(::Type{T}, dim::Integer, tg::Integer, kt::Integer) where {T} =
-    _DEVICE_BINARY_BWD[](T, Int(dim), Int(tg), Int(kt))
-
-"""
-    calibrate!([T=Float32]; dim, force=false)
-
-Measure this device once and persist the result, so a later first call is a file read.
-
-Run this deliberately, ahead of any latency-sensitive work: it compiles and times every candidate
-configuration, which takes seconds. It is keyed by `(device, dim, T)` and is **not** keyed by
-sequence length — the compiled binary takes `n` as a runtime argument and choosing a configuration
-for a given `n` is an argmin over the cached numbers, so there is nothing to pre-tune per `n`.
-
-`T` is the STORAGE element type; accumulation is always `Float32` (see `src/kernels/flash/forward.jl`). It is
-part of the key because it changes which configurations are legal, not merely how fast they are.
-
-Implemented by the loaded backend extension; throws if none is.
-"""
-function calibrate! end
-
-"""
-    _sdpa_kernel_bwd!(q, k, v, mask, bias, o, lse, dO) -> (dq, dk, dv, dbias)
-
-The reverse of [`_sdpa_kernel`](@ref): run the selected entry's backward stages.
-
-**Empty here on purpose.** This is a seam, not an implementation. A backend extension adds a method
-for its own array type (`LuxTriangleAttentionMetalExt` for `MtlArray`, and the Reactant extension
-for traced arrays), and each does the same thing: look up the kernel [`LTA_KERNEL`](@ref) names,
-resolve its compiled stages for this problem, and run them in the order the entry declares.
-
-Everything that varies between kernels — how many launches the backward takes, which gradient each
-one writes, what residuals it reads — is DATA on the entry (see `KernelStage`), so a backend
-implements the walk once and never needs to know which kernel it is running.
-
-`o` and `lse` are the forward's own outputs for these operands, both required residuals: `o` builds
-`delta`, and `lse` is used as-is to recompute attention weights a tile at a time. `dO` is the
-incoming cotangent. There is deliberately no `dout` stage — `dO` is an input to the backward, not
-something a kernel produces — and no `dbias` stage in our own entry, because our `dq` kernel writes
-`dbias` alongside `dq` via atomics.
-
-Callers are [`LuxTriangleAttentionEnzymeExt`](@ref)'s reverse rule on the concrete path, and the
-`enzyme.reverse` function the Reactant extension attaches to its `stablehlo.custom_call`.
-"""
-function _sdpa_kernel_bwd! end
-

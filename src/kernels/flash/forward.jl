@@ -41,7 +41,7 @@
 #
 # `lse` is likewise `Float32`: it is the residual the backward reconstructs probabilities from.
 # So low-precision storage buys bandwidth and local-memory headroom (a smaller `T` makes larger `KT`
-# legal, see `candidate_configs`) without touching the arithmetic that needs the range.
+# legal, see `admissible` in `flash/tune.jl`) without touching the arithmetic that needs the range.
 #
 
 const _LOG2E = Float32(1.4426950408889634)
@@ -67,7 +67,7 @@ Per key tile of `KT` keys, the group stages `k`, `v` and the tile's key mask int
 thread then walks the tile in SUB-BLOCKS of `SB` keys. A sub-block's `SB` scores are formed first,
 their maximum updates the running maximum ONCE, and the accumulator is rescaled once — rather than
 once per key, which costs a full `DIM`-wide multiply and a second exponential per key. `SB` trades
-that saving against `SB` extra live registers and is tuned per device (see `candidate_configs`).
+that saving against `SB` extra live registers and is tuned per device (see `flash/tune.jl`).
 
 Softmax runs in base 2: `scale·log2(e)` is folded into `q` once and `log2(e)` into each bias value,
 so every exponential is a bare `exp2`. `lse` is converted back to the natural log on the way out.
@@ -77,8 +77,11 @@ negative, `-floatmax`) for a masked one or one past `n`, so the inner loop has n
 key then has `p = exp2(≈ -floatmax - m) = 0` exactly wherever its row has a live key. A row whose
 leading keys are all masked accumulates finite garbage until its first live key arrives, and that
 key's correction factor `exp2(≈ -floatmax - m_live) = 0` wipes it exactly. A row with NO live key
-never leaves `m ≈ neg_inf`; it is detected at the end and written as `o = NaN`, `lse = -Inf`, the
-same result the softmax of an all-`-Inf` row gives.
+never leaves `m ≈ neg_inf`: every score is `neg_inf` exactly (the real score is absorbed, `|s| ≪ ulp(floatmax)`),
+so every key, live or past `n`, has `p = 1`, and the accumulator holds `Σₖ vₖ` (keys past `n` stage `v = 0`).
+It is detected at the end and written as UNIFORM attention, `o = Σₖ vₖ / n` (the mean of `v`, what OpenFold's and
+Boltz2's finite `-1e9` mask gives such a row; LuxLib's `-Inf` would give NaN) and `lse = -Inf`, the marker
+the backward reads. The branch is after the key loop, so the hot loop is the same code as without it.
 
 # Layout
 `n` is the attended length (queries = keys) and `nouter` the OUTER length the attention is batched over.
@@ -193,7 +196,7 @@ buffer table, is the same for all four specialisations. `HB = HM = true` is the 
 
     if active
         if m <= 0.5f0 * neg_inf    # no live key in this row: see "Algorithm" above
-            _kstore!(o, accv, Float32(NaN), qb, T)
+            _kstore!(o, accv, inv(Float32(n)), qb, T)
             unsafe_store!(lse, -Inf32, lrow * n + j + Int32(1))
         else
             _kstore!(o, accv, inv(l), qb, T)
@@ -326,21 +329,6 @@ backward.
 end
 
 """
-    launch_geometry(n, heads, tg; nouter=n) -> (; ndrange, workgroupsize, ngroups)
-
-The launch parameters for a problem, in the 1-D form KernelAbstractions requires (see the note at the top).
-
-`ndrange` is expressed in THREADS and is what the context's iterspace is built from; `ngroups` is
-the number of groups a backend should actually dispatch, as a 1-D grid. `nouter` is the outer
-extent (see [`flash_fwd!`](@ref)); it defaults to `n`, the triangle-attention case. The same
-geometry serves every stage: the backward's key-side kernels simply read the query axis as keys.
-"""
-function launch_geometry(n::Integer, heads::Integer, tg::Integer; nouter::Integer=n)
-    ndrange = (cld(n, tg) * tg, nouter, heads)
-    return (; ndrange, workgroupsize=(tg, 1, 1), ngroups=cld(n, tg) * nouter * heads)
-end
-
-"""
     stage_kernel(stage) -> KernelAbstractions kernel function
 
 The `@kernel` implementing one stage of the built-in entry: `:fwd`, `:dq`, `:dk` or `:dv`.
@@ -353,59 +341,34 @@ stage_kernel(stage::Symbol) =
     throw(ArgumentError("no built-in kernel for stage `:$stage`; stages are $(FLASH_STAGES)"))
 
 """
-    kernel_object(backend, tg; ndrange=nothing, stage=:fwd) -> KernelAbstractions.Kernel
+    kernel_argtypes(stage, T, dim, cfg, hasbias=true, hasmask=true) -> Tuple
 
-The KernelAbstractions kernel for one stage, specialised for a backend and group size.
+The argument types of one stage's kernel AFTER KernelAbstractions' context, in signature order, for
+`KernelDispatch.ka_compile`: `AbstractArray{X}` for a buffer (bound as a raw device pointer to `X`), a bits type
+for a scalar, `Val{x}` for a compile-time parameter (no buffer slot, so the ABI is the same for every
+`hasbias`/`hasmask` combination). This is the contract the launch binds against: [`SDPA`](@ref)'s
+`forward`/`backward` pass exactly these arguments, in this order.
 
-Passing `ndrange` bakes the problem size in, which makes the context a **ghost type** — it occupies
-no buffer slot, giving the cleanest possible ABI, at the cost of one compiled binary per `n`.
-Leaving it `nothing` keeps the context a real 16-byte argument that carries the iterspace, and the
-compiled binary is then **independent of `n`**.
-
-Measured on Metal: the two are within 1% of each other at every size, i.e. inside noise. Prefer the
-`n`-independent form — the binary is reusable and nothing is given up for it.
+The storage type `T` is used for `q`, `k`, `v`, `o`, `dO` and the bias; `lse`, `delta` and `dbias` are
+`Float32`, never narrowed; the mask is `Bool`. The four `Int32`s are `n`, `nouter`, `nh`, `mheads`.
 """
-function kernel_object(backend, tg::Integer; ndrange=nothing, stage::Symbol=:fwd)
-    kern = stage_kernel(stage)
-    return ndrange === nothing ? kern(backend, (tg, 1, 1)) : kern(backend, (tg, 1, 1), ndrange)
+function kernel_argtypes(stage::Symbol, ::Type{T}, dim::Integer, cfg,
+    hb::Bool=true, hm::Bool=true) where {T}
+    A(x) = AbstractArray{x}
+    tg, kt = cfg.tg, cfg.kt
+    ints = (Int32, Int32, Int32, Int32)
+    flags = (Val{hb}, Val{hm})
+    return stage === :fwd ?
+           (A(T), A(Float32), A(T), A(T), A(T), A(T), A(Bool), Float32, Float32, ints...,
+        Val{T}, Val{dim}, Val{tg}, Val{kt}, Val{cfg.sb}, flags...) :
+           stage === :dq ?
+           (A(T), A(Float32), A(T), A(T), A(T), A(T), A(Bool), A(T), A(Float32), A(Float32), Float32, ints...,
+        Val{T}, Val{dim}, Val{tg}, Val{kt}, flags...) :
+           stage === :dk ?
+           (A(T), A(T), A(T), A(T), A(T), A(Bool), A(T), A(Float32), A(Float32), Float32, ints...,
+        Val{T}, Val{dim}, Val{tg}, Val{kt}, flags...) :
+           stage === :dv ?
+           (A(T), A(T), A(T), A(T), A(Bool), A(T), A(Float32), Float32, ints...,
+        Val{T}, Val{dim}, Val{tg}, Val{kt}, flags...) :
+           throw(ArgumentError("no built-in kernel for stage `:$stage`; stages are $(FLASH_STAGES)"))
 end
-
-"""
-    kernel_context(backend, n, heads, tg; nouter=n, static=false, stage=:fwd)
-        -> (ctx, ngroups, is_ghost)
-
-Build the KernelAbstractions launch context for a problem.
-
-The context is produced by `KernelAbstractions.mkcontext`, never by hand: a backend that needs it in a buffer should
-upload this value as-is. Its internal layout is KernelAbstractions's business and must not be assumed.
-It does not depend on which kernel it is for — only on the geometry — so `stage` matters only for
-`static` builds, where the ndrange is baked into that stage's binary.
-
-`nouter` changes only the iterspace the context CARRIES, never the compiled code, so one binary
-serves every `(n, nouter)` — except under `static`, which bakes the whole ndrange in.
-"""
-function kernel_context(backend, n::Integer, heads::Integer, tg::Integer;
-    nouter::Integer=n, static::Bool=false, stage::Symbol=:fwd)
-    g = launch_geometry(n, heads, tg; nouter)
-    obj = kernel_object(backend, tg; ndrange=(static ? g.ndrange : nothing), stage)
-    nd, _, iterspace, _ = KernelAbstractions.launch_config(obj, g.ndrange, g.workgroupsize)
-    ctx = KernelAbstractions.mkcontext(obj, nd, iterspace)
-    return (ctx, length(KernelAbstractions.blocks(iterspace)), sizeof(typeof(ctx)) == 0)
-end
-
-"""
-    kernel_signature(ctx_type, PT, PL, PB, T, dim, tg, kt, sb, hb=true, hm=true) -> Type
-
-Argument tuple type for ahead-of-time compilation of [`flash_fwd!`](@ref). Backends hand this to
-their own compiler; the ordering here is the contract the `stablehlo.custom_call` binds against.
-
-`PT` is a pointer to the storage type `T` (used for `q`, `k`, `v`, `o`, `bias_t`), `PL` a pointer to
-`Float32` (the `lse` residual, which is never narrowed), and `PB` a pointer to `Bool` (the mask).
-The four `Int32`s are `n`, `nouter`, `nh`, `mheads`. `hb`/`hm` are the has-bias / has-mask flags
-(see the kernel's docstring); being `Val`s they occupy no buffer slot, so the ABI is the same for
-every combination.
-"""
-kernel_signature(::Type{C}, ::Type{PT}, ::Type{PL}, ::Type{PB},
-    ::Type{T}, dim, tg, kt, sb, hb::Bool=true, hm::Bool=true) where {C,PT,PL,PB,T} =
-    Tuple{C,PT,PL,PT,PT,PT,PT,PB,Float32,Float32,Int32,Int32,Int32,Int32,
-        Val{T},Val{dim},Val{tg},Val{kt},Val{sb},Val{hb},Val{hm}}
