@@ -16,7 +16,7 @@ include("utils.jl")
 export resolve_defaults
 
 include("layers/primitives.jl")
-export LayerNormNoBias
+export LayerNormNoBias, StableLayerNorm
 
 include("layers/glu.jl")
 export GatedLinearUnit, SwiGLU
