@@ -54,7 +54,7 @@ function TriMulCore(
         glu_b = ChannelsLast(GatedLinearUnit(chn_in => chn_hidden; fused=fused_glu, use_bias))
     end
 
-    layer_norm_out = ChannelsLast(Lux.LayerNorm((chn_hidden, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps))
+    layer_norm_out = ChannelsLast(StableLayerNorm((chn_hidden, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps))
     
     # Output Gate: Dual input (chn_hidden from Y, chn_in from X)
     glu_out = ChannelsLast(GatedLinearUnit((chn_hidden, chn_in) => chn_in; fused=false, use_bias))

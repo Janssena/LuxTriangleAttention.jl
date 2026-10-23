@@ -58,7 +58,7 @@ function TriangleAttention(
     use_bias = resolve_defaults(use_bias, (:layer_norm, :linear, :mha))
     shape = (chn_in, ntuple(one, rank-2)...)
     layer_norm = if use_bias.layer_norm
-        Lux.LayerNorm(shape; dims=1, epsilon=layernorm_eps)
+        StableLayerNorm(shape; dims=1, epsilon=layernorm_eps)
     else
         LayerNormNoBias(shape; dims=1, epsilon=layernorm_eps)
     end

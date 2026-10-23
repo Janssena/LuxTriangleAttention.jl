@@ -35,7 +35,7 @@ function TriangleMultiplication(
     layernorm_eps=1f-5, kwargs...
 )
     return TriangleMultiplication(
-        Lux.LayerNorm((chn_in, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps),
+        StableLayerNorm((chn_in, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps),
         TriMulCore(chn_in, chn_hidden; is_outgoing, layernorm_eps, rank, kwargs...)
     )
 end
