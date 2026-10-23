@@ -6,7 +6,7 @@ convention is channels-first (`[in, ...]`). Supported: `Lux.Dense`, `Lux.LayerNo
 the channel axis only) and [`GatedLinearUnit`](@ref)/[`SwiGLU`](@ref). Any other layer throws.
 
 The parameters and states are the wrapped layer's own, unnested (an `AbstractLuxWrapperLayer`), so
-`ChannelsLast(Dense(C => H))` has exactly the parameter tree of `Dense(C => H)`: the same
+`ChannelsLast(Dense(chn => hidden))` has exactly the parameter tree of `Dense(chn => hidden)`: the same
 initialisation, the same weight loading.
 
 ## Why
@@ -14,7 +14,7 @@ initialisation, the same weight loading.
 A `Dense` on channels-last data computes `x · Wᵀ` instead of `W · x`, and the result is
 channels-last too. Inside a layer this is often cheaper:
 - a channels-last `[N², H]` projection IS the per-channel `[N, N]` "planes" layout a batched
-  contraction over tokens wants (TriMulCore), so no `permutedims` is needed before it;
+  contraction over tokens wants (e.g. TriMulCore), so no `permutedims` is needed before it;
 - under Reactant → jax-mps, channels-last chains lower to row-major `dot_general`s, which jax-mps runs
   1.1–1.9× faster (docs/FEATURE_jaxmps_dot_orientation.md §3b).
 
@@ -57,26 +57,43 @@ function (m::ChannelsLast{<:Lux.Dense})(x::AbstractArray, ps, st)
     y = _bias_act(d.activation, _rows(x) * transpose(ps.weight), ps)
     return _unrows(y, x), st
 end
+
 _bias_act(σ, y, ps) = haskey(ps, :bias) ? σ.(y .+ transpose(ps.bias)) : σ === identity ? y : σ.(y)
+
+# The wrapped LayerNorm's scale and bias as broadcastable against channels-last `x` (channels on the LAST
+# axis), after checking it normalises the channel axis only.
+function _cl_layernorm_args(ln::Lux.LayerNorm, x::AbstractArray{T,N}, ps) where {T,N}
+    (ln.dims == 1 || ln.dims == (1,)) && all(isone, Base.tail(Tuple(ln.shape))) || throw(ArgumentError(
+        "ChannelsLast(LayerNorm) needs a LayerNorm over the channel axis only (`LayerNorm((C,); dims=1)`), got $ln"))
+    pshape = (ntuple(one, N - 1)..., size(x, N))
+    scale = haskey(ps, :scale) ? reshape(ps.scale, pshape) : nothing
+    bias = haskey(ps, :bias) ? reshape(ps.bias, pshape) : nothing
+    return scale, bias
+end
 
 function (m::ChannelsLast{<:Lux.LayerNorm})(x::AbstractArray{T,N}, ps, st) where {T,N}
     ln = m.layer
-    (ln.dims == 1 || ln.dims == (1,)) && all(==(1), Base.tail(Tuple(ln.shape))) || throw(ArgumentError(
-        "ChannelsLast(LayerNorm) needs a LayerNorm over the channel axis only (`LayerNorm((C,); dims=1)`), got $ln"))
-    pshape = (ntuple(Returns(1), N - 1)..., size(x, N))
-    scale = haskey(ps, :scale) ? reshape(ps.scale, pshape) : nothing
-    bias = haskey(ps, :bias) ? reshape(ps.bias, pshape) : nothing
+    scale, bias = _cl_layernorm_args(ln, x, ps)
     # Uses `Lux.Utils.eltype`, not `T`: under Reactant `T` is a `TracedRNumber`.
     eps = convert(Lux.Utils.eltype(x), ln.epsilon)
     return Lux.LuxLib.layernorm(x, scale, bias, ln.activation, N, eps), st
 end
 
+# `StableLayerNorm`: the plain LayerNorm above for anything but 16-bit data; Float32 statistics for that.
+function (m::ChannelsLast{<:StableLayerNorm{<:Lux.LayerNorm}})(x::AbstractArray{T,N}, ps, st) where {T,N}
+    ln = m.layer.layer
+    ishalf(realtype(eltype(x))) || return ChannelsLast(ln)(x, ps, st)
+    scale, bias = _cl_layernorm_args(ln, x, ps)
+    return layernorm_f32stats(x, scale, bias, ln.activation, N, ln.epsilon, realtype(eltype(x))), st
+end
+
 function (m::ChannelsLast{<:GatedLinearUnit{True}})(x::AbstractArray{T,N}, ps, st) where {T,N}
     glu = m.layer
-    P, _ = ChannelsLast(glu.linear)(x, ps.linear, st.linear)      # [..., 2·out]: values, then gates
+    proj, _ = ChannelsLast(glu.linear)(x, ps.linear, st.linear)      # [..., 2·out]: values, then gates
     n = glu.out_chn
     front = ntuple(Returns(Colon()), N - 1)
-    return view(P, front..., 1:n) .* glu.activation.(view(P, front..., (n + 1):(2n))), st
+    y = view(proj, front..., 1:n) .* glu.activation.(view(proj, front..., (n + 1):(2n)))
+    return y, st
 end
 
 (m::ChannelsLast{<:GatedLinearUnit{False}})(x::AbstractArray, ps, st) = m((x, x), ps, st)
