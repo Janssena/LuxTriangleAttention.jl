@@ -20,10 +20,10 @@ Multi-head attention layer. Supports self-attention, cross-attention, and gated 
   (where possible).
 - `use_gate`: If `true` (or `static(true)`), applies a sigmoid gating to the attention output.
 - `use_kernel`: If `true` (or `static(true)`), routes attention through the default (or user-defined) 
-  fused kernel (see [`register_kernel!`](@ref) / [`use_kernel!`](@ref) / [`tune_flash_kernel!`](@ref)) 
+  fused kernel (see [`use_kernel!`](@ref) / [`tune_flash_kernel!`](@ref)) 
   instead of `Lux.scaled_dot_product_attention`. Defaults to `false`.
 
-  This only takes effect on GPU arrays. On CPU, [`_sdpa_kernel`](@ref) always runs the ordinary
+  This only takes effect on GPU arrays. On CPU, [`SDPA`](@ref) always runs the ordinary
   softmax regardless of this flag. A model built with `use_kernel=true` still runs (correctly, 
   just without the speedup); the flag applies the moment the arrays are actually on a device with a 
   usable kernel selected.
@@ -49,6 +49,12 @@ Multi-head attention layer. Supports self-attention, cross-attention, and gated 
   `B == 1`, whose scores are O(N³·H), ~1 GiB per op at N=400. For a 3-D input `[C, N, B]` dim 4 *is* 
   the sample batch, so `chunk_size` is a no-op at `B == 1`. Equivalent to `chunk_size_tri_attn` in the 
   openfold/boltz references.
+
+  **Float16.** The chunked paths are Float16-safe, eagerly on the CPU and rolled under Reactant (a chunk
+  runs in Float32 there, since the compiler may move the `1/√d` scale past `Q·Kᵀ` and overflow the
+  logits). The plain path (`chunk_size=nothing`, `use_kernel=false`) is LuxLib's SDPA, which is not
+  Float16-safe under Reactant and materialises every score; it is for reference and tests, not
+  production. Use `chunk_size` or `use_kernel`.
 
   Under `Reactant.@compile` the Reactant extension rolls the chunk loop into a `stablehlo.while`;
   the plain Julia loop here would be unrolled and scheduled concurrently, preventing any reductions in 
@@ -126,7 +132,7 @@ Attention(chn_in::Int, head_dim::Int, num_heads::Int; kwargs...) =
     Attention(chn_in, chn_in, chn_in, head_dim, num_heads; kwargs...)
 
 Attention(chn_q::Int, chn_kv::Int, head_dim::Int, num_heads::Int; kwargs...) =
-    Attention(chn_in, chn_kv, chn_kv, head_dim, num_heads; kwargs...)
+    Attention(chn_q, chn_kv, chn_kv, head_dim, num_heads; kwargs...)
 
 """
 Ideally we combine with TriAttnCore at some point, as they do exactly the same aside 
@@ -234,32 +240,27 @@ two knobs rather than by branching on their values.
 |:--|:--|:--|
 | `False` | `nothing` | [`_sdpa`](@ref) — `Lux.scaled_dot_product_attention` |
 | `False` | `Int`     | [`_chunked_sdpa`](@ref) — slice dim 4 |
-| `True`  | `nothing` | [`_sdpa_kernel`](@ref) — a fused kernel for this device |
+| `True`  | `nothing` | [`SDPA`](@ref)`()(…)` — a fused kernel for this device |
 | `True`  | `Int`     | error: the two are alternatives, not a combination |
 
 Every route here returns just the bare output array: `Attention`'s forward reshapes and gates it
-directly. `_sdpa_kernel` itself always returns an `(output, lse)` PAIR — `lse` is the residual a
+directly. `SDPA()(…)` itself always returns an `(output, lse)` PAIR — `lse` is the residual a
 device kernel's reverse rule needs, and `nothing` on the host path, where there is no reverse rule
 to feed — so the `use_kernel=true` route below unwraps it with a plain `first`, unconditionally,
-rather than testing the shape of the result. See [`_sdpa_kernel`](@ref)'s docstring in
-`src/kernels/backend.jl` for the full routing.
+rather than testing the shape of the result. See [`SDPA`](@ref)'s docstring for the full routing.
 """
 _sdpa(::False, chunk_size::Int, q, k, v, mask, bias) =
     _chunked_sdpa(chunk_size, q, k, v, mask, bias)
 
-# `_sdpa_kernel` should always return an `(output, lse)` pair: `lse` is the reverse rule's residual 
+# `SDPA()(…)` always returns an `(output, lse)` pair: `lse` is the reverse rule's residual 
 # on a device path and `nothing` on the host path, where there is no reverse rule to feed. Because 
 # the shape is unconditional, unwrapping is a plain `first` rather than a runtime test of the result.
 function _sdpa(::True, ::Nothing, q, k, v, mask, bias)
-    # The kernel is SELF-attention-shaped: keys are read at the queries' own extent (`n`), so a
-    # cross-attention call (Boltz2/AF3's windowed atom attention: 32 queries against 128 keys)
-    # would be mis-addressed rather than rejected. Refuse it here, where the shapes are still the
-    # layer's own and the message can say which knob to turn off.
     size(k)[3:end] == size(q)[3:end] || throw(ArgumentError(
         "`use_kernel=true` needs self-attention-shaped q/k (the fused kernel reads keys at the " *
         "query extent); got q $(size(q)) and k $(size(k)). Use `use_kernel=false` for this " *
         "(cross/windowed) attention."))
-    out, _ = _sdpa_kernel(q, k, v, mask, bias)
+    out, _ = SDPA()(q, k, v, mask, bias)
     return out
 end
 
@@ -274,11 +275,36 @@ _sdpa(::False, ::Nothing, q, k, v, mask, bias) = _sdpa_default(q, k, v, mask, bi
 # (`chunk_size >= L`, or `chunk_size === nothing`)
 _sdpa(q, k, v, mask, bias) = _sdpa_default(q, k, v, mask, bias)
 
-function _sdpa_default(q, k, v, mask, bias)
+_sdpa_default(q, k, v, mask, bias) = _with_dead_rows(_lux_sdpa, q, k, v, mask, bias)
+
+function _lux_sdpa(q, k, v, mask, bias)
     output, _scores = Lux.scaled_dot_product_attention(
         q, k, v; head_dim=1, token_dim=3, mask, bias
     )   # attends over token dim (= 4 in python)
     return output
+end
+
+"""
+    _with_dead_rows(sdpa, q, k, v, mask, bias)
+
+`sdpa(q, k, v, mask, bias)` with the behaviour of a FULLY MASKED key set pinned down. Masked logits are
+`-Inf` in LuxLib, so a query whose keys are all masked softmaxes over `-Inf` and comes out NaN. OpenFold
+and Boltz2 add a large FINITE negative (`1e9·(mask - 1)`) instead, which makes every logit of such a row
+equal, so the row attends uniformly and returns the MEAN of `v`; this does the same, exactly and in any
+precision: the output of a dead `(outer index, batch)` slice is the mean of `v` over the keys, and its
+gradient reaches `v` (`dO / n` per key) but not `q`, `k` or `bias`, the logits having been replaced.
+The fused kernels follow the same rule, see [`SDPA`](@ref).
+
+Done around `sdpa` rather than inside it: the dead slices are given an all-live mask, so `sdpa` stays
+finite there (its NaN would otherwise poison the gradient through the `ifelse`: `0 * NaN`), and their
+output is then replaced. `mask` is `[n_keys, 1, 1, …]` (`true` = keep), so a slice is dead when
+`any(mask; dims=1)` is false.
+"""
+function _with_dead_rows(sdpa, q, k, v, mask, bias)
+    isnothing(mask) && return sdpa(q, k, v, nothing, bias)
+    live = any(mask; dims=1)
+    out = sdpa(q, k, v, mask .| .!live, bias)
+    return ifelse.(live, out, sum(v; dims=3) ./ size(v, 3))
 end
 
 # fused qkv
@@ -286,9 +312,9 @@ function _prep_qkv(qkv::Lux.Dense, x::AbstractArray, ps, st; head_dim, num_heads
     _qkv, st_qkv = qkv(x, ps, st)# [3 * H * head_dim, N, B] or [3 * H * head_dim, N, N, B]
 
     _qkv_reshaped = reshape(_qkv, head_dim, num_heads, 3, size(_qkv)[2:end]...)
-    q = view(_qkv_reshaped, :, :, 1, ntuple(_ -> Colon(), ndims(_qkv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
-    k = view(_qkv_reshaped, :, :, 2, ntuple(_ -> Colon(), ndims(_qkv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
-    v = view(_qkv_reshaped, :, :, 3, ntuple(_ -> Colon(), ndims(_qkv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
+    q = view(_qkv_reshaped, :, :, 1, ntuple(Returns(Colon()), ndims(_qkv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
+    k = view(_qkv_reshaped, :, :, 2, ntuple(Returns(Colon()), ndims(_qkv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
+    v = view(_qkv_reshaped, :, :, 3, ntuple(Returns(Colon()), ndims(_qkv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
     return (q, k, v), st_qkv
 end
 
@@ -299,8 +325,8 @@ function _prep_qkv(qkv::Lux.Chain, x::Tuple, ps, st; head_dim, num_heads)
 
     _kv_reshaped = reshape(_kv, head_dim, num_heads, 2, size(_kv)[2:end]...)
     q = reshape(q, head_dim, num_heads, size(q)[2:end]...) # [H, head_dim, N, B]
-    k = view(_kv_reshaped, :, :, 1, ntuple(_ -> Colon(), ndims(_kv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
-    v = view(_kv_reshaped, :, :, 2, ntuple(_ -> Colon(), ndims(_kv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
+    k = view(_kv_reshaped, :, :, 1, ntuple(Returns(Colon()), ndims(_kv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
+    v = view(_kv_reshaped, :, :, 2, ntuple(Returns(Colon()), ndims(_kv_reshaped) - 3)...) # [H, head_dim, N, B] or [H, head_dim, N, N, B]
     return (q, k, v), (q=st_q, kv=st_kv)
 end
 
