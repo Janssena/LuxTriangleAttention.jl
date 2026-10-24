@@ -1,16 +1,18 @@
 # A second flash-attention kernel, `:flash_mma`: the same algorithm as `flash/` (online softmax,
 # Float32 accumulation, base-2 scores, the same residuals), with every matrix product on the GPU's
-# matrix units — 8×8 `simdgroup_matrix` multiply-accumulates on Metal. Selected with
-# `use_kernel!(:flash_mma)`; the original kernel (`:$(RESERVED_KERNEL_NAME)`, `flash/`) is untouched
-# and stays the default. Design, measurements and the road to here: docs/done/FEATURE_flash_mma.md.
+# matrix units — 8×8 `simdgroup_matrix` multiply-accumulates on Metal, `mma.sync` tensor-core products
+# on NVIDIA. Selected with `use_kernel!(:flash_mma)`; the original kernel (`:$(RESERVED_KERNEL_NAME)`,
+# `flash/`) is untouched and stays the default. Design, measurements and the road to here:
+# docs/done/FEATURE_flash_mma.md.
 #
 # ## Backend hooks
 #
 # Like `flash/`, this file names no backend symbol. The few operations KernelAbstractions has no
 # notion of — matrix fragments and the lanes that hold them — are hooks, declared below and
-# implemented per backend (Metal: `ext/LuxTriangleAttentionMetalExt/flash_mma.jl`), dispatched on
-# KernelDispatch' backend tag (`MetalBackendTag`, ...), passed as a `Val{typeof(tag)}` kernel parameter
-# that takes no buffer slot.
+# implemented per backend (Metal: `ext/LuxTriangleAttentionMetalExt/flash_mma.jl`, CUDA:
+# `ext/LuxTriangleAttentionCUDAExt/flash_mma.jl`), dispatched on KernelDispatch' backend tag
+# (`MetalBackendTag`, `CUDABackendTag`, ...), passed as a `Val{typeof(tag)}` kernel parameter that takes no
+# buffer slot.
 #
 # ## Precision
 #
@@ -27,16 +29,25 @@
 # `dO`, the FlashAttention-2 caveat. On the M1, BFloat16 operands are rejected by verification: Apple's
 # compiler cannot build a bfloat fragment from registers (see `ext/LuxTriangleAttentionMetalExt/flash_mma.jl`).
 #
-# The algorithm assumes the fragment shape every hook speaks: an 8×8 fragment in which each of a
-# 32-lane SIMD group's lanes holds TWO ADJACENT ENTRIES OF ONE ROW, so the four lanes holding a row
-# can reduce it with shuffles (`_mma_rowmax`/`_mma_rowsum`). Apple's simdgroup matrices are laid out
-# this way (measured: `test/ext/metal/flash_mma.test.jl`); so is the accumulator of NVIDIA's
-# `mma.sync` m16n8, row for row, which is what a CUDA port would implement the hooks with.
+# ## The fragment shape
+#
+# The algorithm is written against a fragment shape the backend states (`_mma_shape`): a product
+# `C[FM×FN] += A[FM×FK]·B[FK×FN]`. Each of a 32-lane SIMD group's lanes holds, in an accumulator, TWO ADJACENT
+# ENTRIES of each of `FM÷8` rows (its row SLOTS: rows `fr`, `fr+8`, …), so the lanes holding a row can reduce it
+# with shuffles (`_mma_rowmax`/`_mma_rowsum`).
+#
+#   Metal   8×8×8,   one slot: an 8×8 `simdgroup_matrix` (measured: `test/ext/metal/flash_mma.test.jl`).
+#   NVIDIA  16×8×16, two slots: `mma.sync` m16n8k16, whose accumulator holds rows g and g+8, columns 2t, 2t+1
+#           (g = lane÷4, t = lane%4). Two adjacent n8 accumulators are exactly one k16 operand `A`
+#           (`_mma_pfrag`), so the probabilities never leave registers there either.
+#
+# Everything the kernels index by "row" is indexed by SLOT `u = 1…R·FM÷8`: slot `u` is row `fr + 8(u-1)` of the
+# simdgroup's block, whatever the shape, and fragment `rb` provides slots `NR(rb-1)+1 … NR·rb`.
 #
 # ## Why the softmax runs in registers
 #
-# The scores of a key tile are never written anywhere: each lane reads its two entries of each score
-# fragment, adds bias and mask, reduces the row maximum and sum across the row's four lanes, and
+# The scores of a key tile are never written anywhere: each lane reads its entries of each score
+# fragment, adds bias and mask, reduces the row maximum and sum across the row's lanes, and
 # writes the probabilities into a fresh fragment for the `P·V` product. The accumulator is rescaled
 # entry by entry the same way. A first version that staged scores and probabilities through local
 # memory and rescaled with a diagonal matrix product was no faster than the scalar kernel; this one
@@ -49,7 +60,7 @@
 #          transposed: dK, dV, and dbias (atomics, as the bias is shared across the outer index)
 #   :dq    one threadgroup per (query tile, …): dQ
 #
-# A group covers `rows = 8·R·NSG` queries (or keys) with `32·NSG` threads, which the stage's
+# A group covers `rows = FM·R·NSG` queries (or keys) with `32·NSG` threads, which the stage's
 # binary records as its `tile = (rows, 1, 1)`, so a launch of `extent = (n, nouter, H·B)` dispatches the
 # right number of groups.
 
@@ -58,12 +69,28 @@
 # ---------------------------------------------------------------------------------------------
 
 """
-    _mma_load(be, a, r, c) -> fragment
+    _mma_shape(be) -> (FM, FN, FK)
 
-The 8×8 fragment of local-memory matrix `a` whose top-left entry is `a[r, c]` (1-based). `a` is a
-column-major `@localmem` array; the fragment is the ordinary (non-transposed) matrix block.
+The product `C[FM×FN] += A[FM×FK]·B[FK×FN]` the backend's matrix unit computes; the kernels are written against it.
+`FM` is a multiple of 8 (`FM÷8` row slots per lane, see "The fragment shape" in this file); `FN`, `FK` divide the
+head dimension (`FK`) and the key / query tile (`FK`). Defaults to the 8×8×8 of [`MetalBackendTag`] for any backend
+(the host side asks it too, with no device loaded).
 """
-function _mma_load end
+_mma_shape(::KernelBackend) = (8, 8, 8)
+
+# The same, from the tag's TYPE, for the `@generated` builders (they see types).
+_mma_dims(::Type{BE}) where {BE} = _mma_shape(BE())
+
+"""
+    _mma_load_a(be, a, r, c) -> fragment
+    _mma_load_b(be, a, r, c) -> fragment
+
+The `A` operand (`FM×FK` block) or the `B` operand (`FK×FN` block) of local-memory matrix `a` whose top-left entry is
+`a[r, c]` (1-based). `a` is a column-major `@localmem` array holding the matrix as it enters the product (rows
+first), so a `B` block is read down its columns.
+"""
+function _mma_load_a end
+function _mma_load_b end
 
 """`_mma_zero(be, E)`: a fragment of zeros of element type `E`, valid as an accumulator."""
 function _mma_zero end
@@ -71,48 +98,68 @@ function _mma_zero end
 """`_mma(be, a, b, c) -> c + a·b`, Float32 accumulator `c`; `a`, `b` both Float32, Float16 or BFloat16."""
 function _mma end
 
-"""`_mma_pair(be, f) -> (x, y)`: this lane's two entries of fragment `f`, as Float32."""
+"""`_mma_pair(be, f, s) -> (x, y)`: this lane's two entries of row slot `s` of fragment `f`, as Float32."""
 function _mma_pair end
 
-"""`_mma_setpair(be, f, x, y) -> fragment`: `f` with this lane's two entries replaced."""
+"""`_mma_setpair(be, f, s, x, y) -> fragment`: `f` with this lane's two entries of row slot `s` replaced."""
 function _mma_setpair end
 
-"""`_mma_lane(be, lane) -> (row, col)`: the (0-based) entries `(row, col)`, `(row, col+1)` that
-lane `lane` (0-based) holds in every fragment."""
+"""`_mma_lane(be, lane) -> (row, col)`: the (0-based) entries `(row + 8(s-1), col)`, `(row + 8(s-1), col+1)`
+that lane `lane` (0-based) holds in every accumulator, for each row slot `s`."""
 function _mma_lane end
 
 """`_mma_rowmax(be, x)`, `_mma_rowsum(be, x)`: reduce `x` across the lanes holding one row."""
 function _mma_rowmax end
 function _mma_rowsum end
 
-@inline _mma_frag(be, ::Type{E}, x, y) where {E} = _mma_setpair(be, _mma_zero(be, E), x, y)
+"""
+    _mma_pfrag(be, E, p1, p2, …) -> operand
+
+The next product's `A` operand, of element type `E`, built from accumulator entries already in registers: the pairs
+`pi = (x, y)` of one row slot of one `FN`-wide block, listed block by block, slot by slot (`FK÷FN` blocks of `FM÷8`
+slots). Falls back to a single pair set into a zero fragment, which is the case when the operand is one block of
+one slot (Metal).
+"""
+@inline _mma_pfrag(be, ::Type{E}, p) where {E} = _mma_frag(be, E, p[1], p[2])
+@inline _mma_frag(be, ::Type{E}, x, y) where {E} = _mma_setpair(be, _mma_zero(be, E), 1, x, y)
 
 # ---------------------------------------------------------------------------------------------
 # Shared pieces
 # ---------------------------------------------------------------------------------------------
 
-# `R` row blocks × `ND` channel blocks of fragments, loaded from a [rows, DIM] local array.
-@inline _mma_rows(be, a, r0, ::Val{R}, ::Val{ND}) where {R,ND} =
-    ntuple(rb -> ntuple(d -> _mma_load(be, a, r0 + 8(rb - 1) + 1, 8(d - 1) + 1), Val(ND)), Val(R))
+# `R` fragments × the `A` operands along the head dimension, loaded from a [rows, DIM] local array.
+@generated function _mma_rows(be, a, r0, ::Val{R}, ::Val{DIM}) where {R,DIM}
+    FM, FN, FK = _mma_dims(be)
+    rows = (Expr(:tuple, (:(_mma_load_a(be, a, r0 + $(FM * (rb - 1) + 1), $(FK * (k - 1) + 1))) for k in 1:DIM÷FK)...)
+            for rb in 1:R)
+    return Expr(:block, Expr(:meta, :inline), Expr(:tuple, rows...))
+end
 
-@inline _mma_zeros(be, ::Val{R}, ::Val{ND}) where {R,ND} =
-    ntuple(_ -> ntuple(_ -> _mma_zero(be, Float32), Val(ND)), Val(R))
+# `R` fragments × the accumulators along the head dimension (`FN` channels each), zeroed.
+@generated function _mma_zeros(be, ::Val{R}, ::Val{DIM}) where {R,DIM}
+    FM, FN, FK = _mma_dims(be)
+    rows = (Expr(:tuple, (:(_mma_zero(be, Float32)) for _ in 1:DIM÷FN)...) for _ in 1:R)
+    return Expr(:block, Expr(:meta, :inline), Expr(:tuple, rows...))
+end
 
-# Store each lane's two entries of `F[rb][d]` (times `w`) straight to device memory: the row is the
-# lane's row (`rows` for block 1), the channels `8(d-1) + col` and the next.
-@generated function _mma_store_rows!(be, out, F, w, base, step, rows, n, col, ::Val{R}, ::Val{ND},
-    ::Type{T}) where {R,ND,T}
+# Store each lane's entries of `F[rb][d]` (times `w`) straight to device memory: the row is the lane's row of the
+# slot (`rows` + 8(u-1)), the channels `FN(d-1) + col` and the next.
+@generated function _mma_store_rows!(be, out, F, w, base, step, rows, n, col, ::Val{R}, ::Val{DIM},
+    ::Type{T}) where {R,DIM,T}
+    FM, FN, FK = _mma_dims(be)
+    NR = FM ÷ 8
     body = Expr[]
-    for rb in 1:R
-        stores = map(1:ND) do d
+    for rb in 1:R, s in 1:NR
+        u = NR * (rb - 1) + s
+        stores = map(1:DIM÷FN) do d
             quote
-                x, y = _mma_pair(be, F[$rb][$d])
-                unsafe_store!(out, T(x * w), ob + Int32($(8(d - 1))))
-                unsafe_store!(out, T(y * w), ob + Int32($(8(d - 1) + 1)))
+                x, y = _mma_pair(be, F[$rb][$d], $s)
+                unsafe_store!(out, T(x * w), ob + Int32($(FN * (d - 1))))
+                unsafe_store!(out, T(y * w), ob + Int32($(FN * (d - 1) + 1)))
             end
         end
         push!(body, quote
-            rr = rows + Int32($(8(rb - 1)))
+            rr = rows + Int32($(8 * (u - 1)))
             if rr < n
                 ob = base + rr * step + col + Int32(1)
                 $(stores...)
@@ -135,84 +182,101 @@ end
 # Forward
 # ---------------------------------------------------------------------------------------------
 
-# One key tile for the R query blocks of this simdgroup. `st[rb] = (m, l)` of this lane's row.
+# One key tile for the R query fragments of this simdgroup. `st[u] = (m, l)` of this lane's row slot `u`.
 @generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, ::Val{R},
-    ::Val{ND}, ::Val{NKB}, ::Val{HB}) where {R,ND,NKB,HB}
+    ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {R,DIM,BK,HB}
+    FM, FN, FK = _mma_dims(be)
+    NR, NKD, NKB, NKK, NDN, NB = FM ÷ 8, DIM ÷ FK, BK ÷ FN, BK ÷ FK, DIM ÷ FN, FK ÷ FN
     body = Expr[]
-    kf(kb, d) = Symbol(:kf_, kb, :_, d)
-    for kb in 0:NKB-1, d in 1:ND
-        push!(body, :($(kf(kb, d)) = _mma_load(be, ks, $(8(d - 1) + 1), $(8kb + 1))))
+    kf(kb, k) = Symbol(:kf_, kb, :_, k)
+    s1(u, kb) = Symbol(:s1_, u, :_, kb)
+    s2(u, kb) = Symbol(:s2_, u, :_, kb)
+    for kb in 0:NKB-1, k in 1:NKD
+        push!(body, :($(kf(kb, k)) = _mma_load_b(be, ks, $(FK * (k - 1) + 1), $(FN * kb + 1))))
     end
     newst = Any[]
     for rb in 1:R
-        s = [(Symbol(:s1_, rb, :_, kb), Symbol(:s2_, rb, :_, kb)) for kb in 0:NKB-1]
+        acc(kb) = Symbol(:acc_, rb, :_, kb)
         for kb in 0:NKB-1
             ex = :(_mma_zero(be, Float32))
-            for d in 1:ND
-                ex = :(_mma(be, Qf[$rb][$d], $(kf(kb, d)), $ex))
+            for k in 1:NKD
+                ex = :(_mma(be, Qf[$rb][$k], $(kf(kb, k)), $ex))
             end
-            a, b = s[kb+1]
+            push!(body, :($(acc(kb)) = $ex))
+        end
+        for s in 1:NR
+            u = NR * (rb - 1) + s
+            for kb in 0:NKB-1
+                a, b = s1(u, kb), s2(u, kb)
+                push!(body, quote
+                    $a, $b = _mma_pair(be, $(acc(kb)), $s)
+                    c = Int32($(FN * kb)) + col
+                    b1, b2 = _mma_bias2(bias, bbs[$u], t + c, n, Val(HB))
+                    $a += b1 + @inbounds(ms[c+Int32(1)])
+                    $b += b2 + @inbounds(ms[c+Int32(2)])
+                end)
+            end
+            m, l, corr = Symbol(:m_, u), Symbol(:l_, u), Symbol(:corr_, u)
+            mx = foldl((x, y) -> :(max($x, $y)), [:(max($(s1(u, kb)), $(s2(u, kb)))) for kb in 0:NKB-1])
             push!(body, quote
-                $a, $b = _mma_pair(be, $ex)
-                c = Int32($(8kb)) + col
-                b1, b2 = _mma_bias2(bias, bbs[$rb], t + c, n, Val(HB))
-                $a += b1 + @inbounds(ms[c+Int32(1)])
-                $b += b2 + @inbounds(ms[c+Int32(2)])
+                $m = max(st[$u][1], _mma_rowmax(be, $mx))
+                $corr = exp2(st[$u][1] - $m)
             end)
+            for kb in 0:NKB-1
+                push!(body, :($(s1(u, kb)) = exp2($(s1(u, kb)) - $m)), :($(s2(u, kb)) = exp2($(s2(u, kb)) - $m)))
+            end
+            sm = foldl((x, y) -> :($x + $y), [:($(s1(u, kb)) + $(s2(u, kb))) for kb in 0:NKB-1])
+            push!(body, :($l = st[$u][2] * $corr + _mma_rowsum(be, $sm)))
+            push!(newst, :(($m, $l)))
         end
-        m, l, corr = Symbol(:m_, rb), Symbol(:l_, rb), Symbol(:corr_, rb)
-        mx = foldl((x, y) -> :(max($x, $y)), [:(max($a, $b)) for (a, b) in s])
-        push!(body, quote
-            $m = max(st[$rb][1], _mma_rowmax(be, $mx))
-            $corr = exp2(st[$rb][1] - $m)
-        end)
-        for (a, b) in s
-            push!(body, :($a = exp2($a - $m)), :($b = exp2($b - $m)))
+        # The probabilities as the next product's operand, one per chunk of `FK` keys.
+        for kc in 1:NKK
+            ps = [:(($(s1(NR * (rb - 1) + s, NB * (kc - 1) + j)), $(s2(NR * (rb - 1) + s, NB * (kc - 1) + j))))
+                  for j in 0:NB-1 for s in 1:NR]
+            push!(body, :($(Symbol(:pf_, rb, :_, kc)) = _mma_pfrag(be, eltype(vs), $(ps...))))
         end
-        sm = foldl((x, y) -> :($x + $y), [:($a + $b) for (a, b) in s])
-        push!(body, :($l = st[$rb][2] * $corr + _mma_rowsum(be, $sm)))
-        for kb in 0:NKB-1
-            a, b = s[kb+1]
-            push!(body, :($(Symbol(:pf_, rb, :_, kb)) = _mma_frag(be, eltype(vs), $a, $b)))
+        for dn in 1:NDN
+            stmts = Any[]
+            for s in 1:NR
+                corr = Symbol(:corr_, NR * (rb - 1) + s)
+                push!(stmts, :((x, y) = _mma_pair(be, f, $s)), :(f = _mma_setpair(be, f, $s, x * $corr, y * $corr)))
+            end
+            push!(body, :($(Symbol(:o_, rb, :_, dn)) = $(Expr(:let, :(f = O[$rb][$dn]), Expr(:block, stmts..., :f)))))
         end
-        for d in 1:ND
-            push!(body, :($(Symbol(:o_, rb, :_, d)) = let f = O[$rb][$d]
-                x, y = _mma_pair(be, f)
-                _mma_setpair(be, f, x * $corr, y * $corr)
-            end))
-        end
-        push!(newst, :(($m, $l)))
     end
-    for kb in 0:NKB-1, d in 1:ND
-        push!(body, :(vf = _mma_load(be, vs, $(8kb + 1), $(8(d - 1) + 1))))
+    for kc in 1:NKK, dn in 1:NDN
+        push!(body, :(vf = _mma_load_b(be, vs, $(FK * (kc - 1) + 1), $(FN * (dn - 1) + 1))))
         for rb in 1:R
-            od = Symbol(:o_, rb, :_, d)
-            push!(body, :($od = _mma(be, $(Symbol(:pf_, rb, :_, kb)), vf, $od)))
+            od = Symbol(:o_, rb, :_, dn)
+            push!(body, :($od = _mma(be, $(Symbol(:pf_, rb, :_, kc)), vf, $od)))
         end
     end
-    Ot = Expr(:tuple, (Expr(:tuple, (Symbol(:o_, rb, :_, d) for d in 1:ND)...) for rb in 1:R)...)
+    Ot = Expr(:tuple, (Expr(:tuple, (Symbol(:o_, rb, :_, d) for d in 1:NDN)...) for rb in 1:R)...)
     return Expr(:block, Expr(:meta, :inline), body..., :(($Ot, $(Expr(:tuple, newst...)))))
 end
 
-# Bias row offsets for this lane's query in each row block: bias[key, query j, bh] at (bh·n + j)·n.
-@inline _mma_bias_rows(bh, n, j0, ::Val{R}) where {R} =
-    ntuple(rb -> (bh * n + min(j0 + Int32(8 * (rb - 1)), n - Int32(1))) * n, Val(R))
+# Bias row offsets for this lane's query in each row slot: bias[key, query j, bh] at (bh·n + j)·n.
+@inline _mma_bias_rows(bh, n, j0, ::Val{U}) where {U} =
+    ntuple(u -> (bh * n + min(j0 + Int32(8 * (u - 1)), n - Int32(1))) * n, Val(U))
 
 @generated function _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, lrow, col, ::Val{R},
-    ::Val{ND}, ::Type{T}) where {R,ND,T}
+    ::Val{DIM}, ::Type{T}) where {R,DIM,T}
+    FM, FN, FK = _mma_dims(be)
+    NR = FM ÷ 8
     body = Expr[]
-    for rb in 1:R
-        stores = map(1:ND) do d
+    for rb in 1:R, s in 1:NR
+        u = NR * (rb - 1) + s
+        stores = map(1:DIM÷FN) do d
             quote
-                x, y = _mma_pair(be, O[$rb][$d])
-                unsafe_store!(o, T(x * w), ob + Int32($(8(d - 1))))
-                unsafe_store!(o, T(y * w), ob + Int32($(8(d - 1) + 1)))
+                x, y = _mma_pair(be, O[$rb][$d], $s)
+                unsafe_store!(o, T(x * w), ob + Int32($(FN * (d - 1))))
+                unsafe_store!(o, T(y * w), ob + Int32($(FN * (d - 1) + 1)))
             end
         end
         push!(body, quote
-            j = j0 + Int32($(8(rb - 1)))
+            j = j0 + Int32($(8 * (u - 1)))
             if j < n
-                m, l = st[$rb]
+                m, l = st[$u]
                 dead = m <= 0.5f0 * _MMA_NEG     # no live key in this row: o = mean(v), lse = -Inf, as `flash/`
                 w = dead ? inv(Float32(n)) : inv(l)   # (every score is `_MMA_NEG`, p = 1: O holds Σₖ vₖ)
                 ob = base + j * step + col + Int32(1)
@@ -235,8 +299,8 @@ Forward of `:flash_mma`. Same buffers, layout and results as [`flash_fwd!`](@ref
 pair bias is read in the ordinary keys-fastest `:bias` layout (each lane reads two adjacent keys of
 its own query row) rather than transposed. `mask` is the DROP mask `[n, nouter, bh ÷ mheads]`.
 
-A group of `32·NSG` threads covers `8·R·NSG` queries; each simdgroup owns `R` blocks of 8 query rows
-and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the group stages `Kᵀ`,
+A group of `32·NSG` threads covers `FM·R·NSG` queries; each simdgroup owns `R` fragments of `FM` query rows
+and holds their `Q` operands for the whole call. Per key tile of `BK` keys the group stages `Kᵀ`,
 `V` (in `PE`) and the additive key mask; see this file's header for the in-register softmax.
 `Q·Kᵀ` multiplies storage-type fragments; `P·V` multiplies `PE` operands; every accumulator is
 `Float32` (see "Precision" in this file's header).
@@ -245,7 +309,9 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
     scale, n, nouter, nh, mheads, ::Val{BE}, ::Val{T}, ::Val{DIM}, ::Val{NSG},
     ::Val{R}, ::Val{BK}, ::Val{HB}, ::Val{HM}, ::Val{PE}) where {BE,T,DIM,NSG,R,BK,HB,HM,PE}
     be = BE()
-    BQ = 8 * R * NSG
+    FM, FN, FK = _mma_shape(be)
+    U = R * (FM ÷ 8)                       # row slots this lane holds
+    BQ = FM * R * NSG
     qs = @localmem T (BQ, DIM)
     ks = @localmem T (DIM, BK)
     vs = @localmem PE (BK, DIM)
@@ -267,10 +333,10 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
     step = nh * Int32(DIM)
     base = row * step + hi * Int32(DIM)
     q0 = qt * Int32(BQ)
-    r0 = sg * Int32(8 * R)
+    r0 = sg * Int32(FM * R)
     fr, col = _mma_lane(be, lane)
-    j0 = q0 + r0 + fr                          # this lane's query in row block 1
-    mb = ((_sdiv(bh, mheads)) * nouter + i) * n
+    j0 = q0 + r0 + fr                          # this lane's query in row slot 1
+    mb = (_sdiv(bh, mheads) * nouter + i) * n
 
     e = tid
     while e < Int32(BQ * DIM)
@@ -280,10 +346,10 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
         e += NT
     end
     @synchronize
-    Qf = _mma_rows(be, qs, r0, Val(R), Val(DIM ÷ 8))
-    O = _mma_zeros(be, Val(R), Val(DIM ÷ 8))
-    st = ntuple(_ -> (_MMA_NEG, 0f0), Val(R))
-    bbs = _mma_bias_rows(bh, n, j0, Val(R))
+    Qf = _mma_rows(be, qs, r0, Val(R), Val(DIM))
+    O = _mma_zeros(be, Val(R), Val(DIM))
+    st = ntuple(_ -> (_MMA_NEG, 0f0), Val(U))
+    bbs = _mma_bias_rows(bh, n, j0, Val(U))
 
     t = Int32(0)
     while t < n
@@ -304,10 +370,9 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
             e += NT
         end
         @synchronize
-        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, Val(R),
-            Val(DIM ÷ 8), Val(BK ÷ 8), Val(HB))
+        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, Val(R), Val(DIM), Val(BK), Val(HB))
         t += Int32(BK)
     end
     _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, (bi * nouter + i) * nh + hi, col,
-        Val(R), Val(DIM ÷ 8), T)
+        Val(R), Val(DIM), T)
 end

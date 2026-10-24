@@ -42,10 +42,30 @@ end
 mma_ops(p) = get(p, :ops, Float32)
 
 # A `:flash_mma` configuration is a parameter point `(; nsg, r, tile, ops)`: `nsg` simdgroups per
-# group, `r` 8-row blocks per simdgroup (a group covers `8·r·nsg` rows), `tile` keys (or, for `:dkv`,
+# group, `r` fragments of `FM` rows per simdgroup (a group covers `FM·r·nsg` rows), `tile` keys (or, for `:dkv`,
 # queries) per staged tile, and `ops` the second products' operand type (`mma_ops`).
 
-mma_rows(c) = 8 * c.r * c.nsg
+# The loaded device backend; `CPUBackend()` when there is none (a host-only machine, the mock-device tests), whose
+# fragment shape and operand types are the defaults.
+mma_backend() = try
+    KernelDispatch.device_backend()
+catch
+    CPUBackend()
+end
+
+# The fragment shape of that backend.
+mma_frag_shape() = _mma_shape(mma_backend())
+
+"""
+    mma_operand_types(be, T) -> Vector{DataType}
+
+The operand types `ops` of the second matrix products the backend can run for storage type `T`: `Float32` and, for
+16-bit storage, `T` itself (the default). A backend extension narrows it; an empty list means `:flash_mma` has no
+configuration for `T` there (CUDA, Float32).
+"""
+mma_operand_types(be, ::Type{T}) where {T} = T === Float32 ? DataType[Float32] : DataType[Float32, T]
+
+mma_rows(c) = first(mma_frag_shape()) * c.r * c.nsg
 mma_threads(c) = 32 * c.nsg
 
 """
@@ -96,7 +116,7 @@ inaccurate, or whose Float16 `dS` overflows on a large `dO` (`DO_SCALE`), is nev
 """
 function tune_grid(::FlashMMA, stage::Symbol, dim::Integer, ::Type{T}, caps::DeviceCaps) where {T}
     stage in FLASH_MMA_STAGES || throw(ArgumentError("unknown `:$FLASH_MMA_NAME` stage `:$stage`"))
-    ops = T === Float32 ? DataType[Float32] : DataType[Float32, T]
+    ops = mma_operand_types(mma_backend(), T)
     return (; nsg=[2, 4, 8, 16], r=[1, 2], tile=[16, 32, 64], ops)
 end
 
@@ -138,7 +158,7 @@ function tune_flash_mma!(lengths=tune_lengths(); dim::Integer, T::Type=Float32, 
     device_kernel_available() || throw(ErrorException(
         "no usable device backend is loaded, so `:$FLASH_MMA_NAME` cannot be compiled. Load the " *
         "package for your GPU (e.g. `using Metal`) first."))
-    dim % 8 == 0 || throw(ArgumentError(
-        "`:$FLASH_MMA_NAME` needs a head dimension that is a multiple of 8; got $dim"))
+    dim % last(mma_frag_shape()) == 0 || throw(ArgumentError(
+        "`:$FLASH_MMA_NAME` needs a head dimension that is a multiple of $(last(mma_frag_shape())) on this device; got $dim"))
     return tune!(FlashMMA(), lengths; dim, T, force)
 end
