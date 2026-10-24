@@ -55,6 +55,36 @@ let caps = LTA.device_caps(KD.device_backend()), k = LTA.FlashScalar()
     end
 end
 
+# Compile one stage the way KernelDispatch's CUDA extension does, but print GPUCompiler's FULL error (every
+# offending call with its stack, file and line), which KernelDispatch's refusal reduces to a "Reason:" line.
+function diagnose(k, stage, T, p)
+    ext = Base.get_extension(KD, :KernelDispatchCUDAExt)
+    GPUCompiler = ext.GPUCompiler
+    argtypes = LTA.stage_argtypes(k, stage, T, 32, p, true, true)
+    tg = LTA.stage_threads(k, p)
+    obj = LTA.stage_kernel(k, stage)(CUDA.CUDABackend(), tg)
+    ftype = ext.FlatKA{typeof(obj.f),tg}
+    sig = Tuple{Int,Int,Int,Int,Int,Int,map(ext._ka_argtype, argtypes)...}
+    job = GPUCompiler.CompilerJob(GPUCompiler.methodinstance(ftype, sig), ext._stateless_config("diag_$stage"))
+    try
+        GPUCompiler.JuliaContext() do _
+            Base.invokelatest(GPUCompiler.compile, :asm, job)
+        end
+        println("    :$stage compiles")
+    catch err
+        lines = split(sprint(showerror, err), '\n')
+        println("    :$stage — ", length(lines), " lines of error; first 70:")
+        foreach(l -> println("      ", l), first(lines, 70))
+    end
+end
+
+println("\n[1b] where the :default stages need CUDA.jl's kernel state (full GPUCompiler error)")
+let caps = LTA.device_caps(KD.device_backend()), k = LTA.FlashScalar()
+    for stage in LTA.FLASH_STAGES
+        diagnose(k, stage, Float32, map(first, LTA.tune_grid(k, stage, 32, Float32, caps)))
+    end
+end
+
 # --- 2. mma.sync m16n8k16 --------------------------------------------------------------------------
 println("\n[2] inline-PTX mma.sync.m16n8k16 (f32 accumulate)")
 
