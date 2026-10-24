@@ -24,6 +24,10 @@ export GatedLinearUnit, SwiGLU
 include("layers/channels_last.jl")
 export ChannelsLast
 
+include("precision.jl")
+public ishalf, mask_value, fold_k, fold_trimul, contraction_mode, layernorm_f32stats
+public ContractionMode, FullPrecision, HalfSafe, Folded
+
 include("kernels/sdpa_op.jl")
 include("kernels/stage_args.jl")
 export SDPA, list_kernels, use_kernel!, current_kernel, RESERVED_KERNEL_NAME

@@ -83,14 +83,51 @@ function (m::TriMulCore)(x_norm::AbstractArray{T,4}, mask, ps, st) where {T}
     H = m.chn_hidden
     x_tok = transpose(reshape(x_norm, C, N * N * B))         # [T, C] lazy, tokens (i, j, b)
 
-    a, b = _ab_planes(m, x_tok, mask, ps, st, N, B)           # [N, N, B·H] each, slot = b + B·(h-1)
-    X = _contract(m.is_outgoing, a, b)                        # [N, N, B·H]
+    a, b, st_ab = _ab_planes(m, x_tok, mask, ps, st, N, B)    # [N, N, B·H] each, slot = b + B·(h-1)
+    # 16-bit data takes one of two paths (`ContractionMode`, src/precision.jl). The contraction stays
+    # in THIS body for every mode — moved into a helper, `Lux.batched_matmul` on these views no
+    # longer infers — and only its operands' width and the output LayerNorm depend on the mode.
+    mode = contraction_mode(x_norm, st)
+    X = _contract(m.is_outgoing, _widen(mode, a), _widen(mode, b))   # [N, N, B·H]
     y_tok = reshape(X, N * N * B, H)                          # token-major: slot order = token order
 
-    y_norm, _ = m.layer_norm_out(y_tok, ps.layer_norm_out, st.layer_norm_out)
-    out_tok, _ = m.glu_out((y_norm, x_tok), ps.glu_out, st.glu_out)          # [N²B, C]
+    y_norm, layer_norm_out = _normalize_out(mode, m, y_tok, ps, st, realtype(eltype(a)))
+    out_tok, glu_out = m.glu_out((y_norm, x_tok), ps.glu_out, st.glu_out)    # [N²B, C]
 
+    # Each sublayer's state is merged into its old one, so a key it does not return (`fold_k`, or a
+    # `gate` the GLU leaves out) stays for the next call and the state keeps its type.
+    st = merge(st, st_ab, (; layer_norm_out=merge(st.layer_norm_out, layer_norm_out),
+                             glu_out=merge(st.glu_out, glu_out)))
     return reshape(permutedims(out_tok, (2, 1)), C, N, N, B), st
+end
+
+# 16-bit data with unscaled parameters (`HalfSafe`): the contraction overflows Float16 (AlphaFold2's
+# multimer template stack reaches |X| ≈ 4.8e5 at N = 494), so it runs in Float32. X is only [N²·B, H].
+_widen(::HalfSafe, a) = Float32.(a)
+_widen(_, a) = a
+
+_normalize_out(::FullPrecision, m, y_tok, ps, st, T) =
+    m.layer_norm_out(y_tok, ps.layer_norm_out, st.layer_norm_out)
+
+# `Folded(k)`: the value halves of a and b carry 2⁻ᵏ (`fold_trimul`), so X = Σ a·b / 4ᵏ stays in range.
+# The output LayerNorm is scale-invariant and removes the 4⁻ᵏ by itself — exactly, once ε is scaled
+# with X's variance (16⁻ᵏ). That ε is far below Float16's range, hence Float32 statistics, and X is
+# normalised in Float32 too: 1/√(σ² + ε·16⁻ᵏ) reaches 4ᵏ/√ε ≈ 1e6 for a token whose X is all zero (a
+# fully masked pair), which is `Inf` in Float16 and turns that token's 0·rstd into NaN.
+_normalize_out(mode::Folded, m, y_tok, ps, st, T) =
+    _layer_norm_out_f32(m, Float32.(y_tok), ps, Float32(m.layer_norm_out.layer.layer.epsilon) * 16.0f0^(-mode.k), T),
+    st.layer_norm_out
+
+# `HalfSafe`: X is Float32; normalise in Float32 and narrow to the data's type.
+_normalize_out(::HalfSafe, m, y_tok, ps, st, T) =
+    _layer_norm_out_f32(m, y_tok, ps, Float32(m.layer_norm_out.layer.layer.epsilon), T),
+    st.layer_norm_out
+
+function _layer_norm_out_f32(m, y_tok, ps, ε, ::Type{T}) where {T}
+    pl = ps.layer_norm_out
+    γ = haskey(pl, :scale) ? reshape(pl.scale, 1, :) : nothing
+    β = haskey(pl, :bias) ? reshape(pl.bias, 1, :) : nothing
+    return layernorm_f32stats(y_tok, γ, β, m.layer_norm_out.layer.layer.activation, 2, ε, T)
 end
 
 # Outgoing (Alg 11): X[i, j] = Σ_k a[i, k] b[j, k]  →  A · Bᵀ per plane
@@ -99,26 +136,32 @@ _contract(::True, a, b) = Lux.batched_matmul(a, Lux.batched_transpose(b))
 _contract(::False, a, b) = Lux.batched_matmul(Lux.batched_transpose(a), b)
 
 """
-    _ab_planes(m::TriMulCore, x_tok, mask, ps, st, N, B) -> (a, b)
+    _ab_planes(m::TriMulCore, x_tok, mask, ps, st, N, B) -> (a, b, st_ab)
 
 Project the normalised input into the gated, masked `a` and `b` representations, laid out as
-`[N, N, B·H]` planes (batch slot `b + B·(h-1)`), ready for the batched contraction.
+`[N, N, B·H]` planes (batch slot `b + B·(h-1)`), ready for the batched contraction. `st_ab` holds the
+updated states of the GLU(s) that ran, keyed by their field names.
 
 With `fused = true` one GLU produces both (`[N²·B, 2H]`, `a` in the first `H` columns); the planes
 are contiguous views of it. With `fused = false`, `glu_a` and `glu_b` produce one each.
 """
 function _ab_planes(m::TriMulCore{True}, x_tok, mask, ps, st, N, B)
     H = m.chn_hidden
-    ab = _apply_tri_mask(first(m.glu_ab(x_tok, ps.glu_ab, st.glu_ab)), mask)   # [N²B, 2H]
+    ab, glu_ab = m.glu_ab(x_tok, ps.glu_ab, st.glu_ab)
+    ab = _apply_tri_mask(ab, mask)                                             # [N²B, 2H]
     planes = reshape(ab, N, N, 2 * B * H)
-    return view(planes, :, :, 1:(B * H)), view(planes, :, :, (B * H + 1):(2 * B * H))
+    a = view(planes, :, :, 1:(B * H))
+    b = view(planes, :, :, (B * H + 1):(2 * B * H))
+    return a, b, (; glu_ab=merge(st.glu_ab, glu_ab))
 end
 
 function _ab_planes(m::TriMulCore{False}, x_tok, mask, ps, st, N, B)
     H = m.chn_hidden
-    a = _apply_tri_mask(first(m.glu_a(x_tok, ps.glu_a, st.glu_a)), mask)
-    b = _apply_tri_mask(first(m.glu_b(x_tok, ps.glu_b, st.glu_b)), mask)
-    return reshape(a, N, N, B * H), reshape(b, N, N, B * H)
+    a, glu_a = m.glu_a(x_tok, ps.glu_a, st.glu_a)
+    b, glu_b = m.glu_b(x_tok, ps.glu_b, st.glu_b)
+    a, b = _apply_tri_mask(a, mask), _apply_tri_mask(b, mask)
+    return reshape(a, N, N, B * H), reshape(b, N, N, B * H),
+           (; glu_a=merge(st.glu_a, glu_a), glu_b=merge(st.glu_b, glu_b))
 end
 
 """
@@ -134,3 +177,40 @@ function _apply_tri_mask(ab::AbstractMatrix{T}, mask::AbstractArray) where {T}
     ab3 = reshape(ab, nn, :, size(ab, 2))                     # [N², B, cols]
     return reshape(ifelse.(reshape(mask, nn, :, 1), ab3, zero(T)), size(ab))
 end
+
+"""
+    fold_trimul(ps, st, k) -> (ps, st)
+
+Prepare a [`TriangleMultiplication`](@ref)'s parameters for the [`Folded`](@ref) path: scale the
+VALUE projections of `a` and `b` (never the gates) by 2⁻ᵏ and record `fold_k = k` in the core's state.
+Apply it to the Float32 parameters, before casting to 16 bits (the scaling is a power of two, so it
+is exact either way, but subnormal weights would round). Use [`fold_k`](@ref)`(L)` for the longest
+sequence the parameters must serve.
+
+The contraction then sums `Σ a·b / 4ᵏ`, and the output LayerNorm (scale-invariant, with ε scaled by
+16⁻ᵏ in the layer) makes the layer's result exactly the unscaled one.
+"""
+function fold_trimul(ps::NamedTuple, st::NamedTuple, k::Integer)
+    s, c = 2.0f0^(-k), ps.core
+    core = if !isempty(c.glu_ab)
+        merge(c, (; glu_ab=_scale_glu_values(c.glu_ab, s)))
+    else                                                     # separate glu_a / glu_b
+        merge(c, (; glu_a=_scale_glu_values(c.glu_a, s), glu_b=_scale_glu_values(c.glu_b, s)))
+    end
+    return merge(ps, (; core)), merge(st, (; core=merge(st.core, (; fold_k=Int(k)))))
+end
+
+# Scale the VALUE rows of one GLU's parameters by `s`, never its gates. A GLU either has its own gate
+# Dense (all of `linear` is values) or is fused: one Dense whose first half of rows are the values and
+# whose second half are the gates. This holds for the fused `a`/`b` GLU and for each of the separate ones
+# (`fused=false` with the default `fused_glu=true` gives fused GLUs of H values and H gates).
+function _scale_glu_values(g::NamedTuple, s)
+    if haskey(g, :gate) && !isempty(g.gate)
+        return merge(g, (; linear=_scale_rows(g.linear, :, s)))
+    end
+    n = size(g.linear.weight, 1) ÷ 2
+    return merge(g, (; linear=_scale_rows(g.linear, 1:n, s)))
+end
+
+# Scale rows `r` (along the output dimension) of a Dense's weight and bias by `s`, out of place.
+_scale_rows(lin::NamedTuple, r, s) = map(a -> (a = copy(a); selectdim(a, 1, r) .*= s; a), lin)
