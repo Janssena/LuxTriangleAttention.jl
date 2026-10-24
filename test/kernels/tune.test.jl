@@ -64,6 +64,9 @@ const LTAt = LuxTriangleAttention
         t = Dict{NamedTuple,Float64}((; tg=256, kt=32) => 1.0, (; tg=64, kt=32) => 1.1, (; tg=32, kt=32) => Inf)
         @test LTAt.choose_config(t) == (; tg=256, kt=32)
         @test_throws ErrorException LTAt.choose_config(Dict{NamedTuple,Float64}((; tg=32) => Inf))
+        # The fastest point a predicate accepts: `tune!` passes "every specialisation's pipeline admits its threads".
+        @test LTAt.choose_config(t, p -> p.tg <= 128) == (; tg=64, kt=32)
+        @test_throws ErrorException LTAt.choose_config(t, p -> p.tg > 1000)
     end
 
     @testset "tune lengths: defaults and the preference" begin

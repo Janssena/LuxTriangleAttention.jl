@@ -316,17 +316,35 @@ end
     choose_config(t) -> NamedTuple
 
 One stage's configuration from its calibration at a length (`calibrate!(…)[stage]`): the fastest
-measured point.
+measured point, or, given a predicate `usable(point)`, the fastest one it accepts.
 """
-function choose_config(t::AbstractDict{<:NamedTuple,Float64})
-    fin = [(p, x) for (p, x) in t if isfinite(x)]
-    isempty(fin) && error("no usable configuration in this calibration")
-    return first(argmin(last, fin))
+function choose_config(t::AbstractDict{<:NamedTuple,Float64}, usable=Returns(true))
+    fin = sort!([(p, x) for (p, x) in t if isfinite(x)]; by=last)
+    for (p, _) in fin
+        usable(p) && return p
+    end
+    error("no usable configuration in this calibration")
 end
+
+# The binaries `tune!` registers per stage: every bias / mask presence, each compiled on its own.
+const _SPECIALISATIONS = ((true, true), (true, false), (false, true), (false, false))
+
+# Whether `p` is dispatchable in EVERY specialisation of `stage`. `measure` checked the general one (bias and mask
+# present); an absent-operand build uses other registers, so its pipeline can admit fewer threads (BFloat16 `:dkv`
+# without a bias: 448 against the 512 threads that were measured), and launching over the limit fails.
+_admits_all(k::BuiltinKernel, stage::Symbol, ::Type{T}, dim::Integer, p::NamedTuple) where {T} =
+    all(_SPECIALISATIONS) do (hb, hm)
+        b = build_stage(k, stage, T, dim, p; hasbias=hb, hasmask=hm)
+        b.threadgroup <= KernelDispatch.max_threads(b)
+    end
+
+# The point `tune!` registers for `stage`: the fastest measured one that every specialisation admits.
+_choose_stage(k::BuiltinKernel, stage::Symbol, ::Type{T}, dim::Integer, t) where {T} =
+    choose_config(t, p -> _admits_all(k, stage, T, dim, p))
 
 """`tuned_config(kernel, T, dim, n) -> Dict(stage => point)`: what [`tune!`](@ref) picks at length `n`."""
 tuned_config(k::BuiltinKernel, ::Type{T}, dim::Integer, n::Integer) where {T} =
-    Dict(s => choose_config(t) for (s, t) in calibrate!(k, T; dim, n))
+    Dict(s => _choose_stage(k, s, T, dim, t) for (s, t) in calibrate!(k, T; dim, n))
 
 """
     tune_lengths() -> Vector{Int}
@@ -377,8 +395,8 @@ function tune!(k::BuiltinKernel, lengths=tune_lengths(); dim::Integer, T::Type=F
         keys_ = [_attention_variant_key(k, T, dim, n; hasbias=hb, hasmask=hm) for hb in (true, false)
                  for hm in (true, false)]
         (!force && all(in(keys(vs)), keys_)) && continue
-        cfgs = Dict(s => choose_config(t) for (s, t) in calibrate!(k, T; dim, n, force))
-        for hb in (true, false), hm in (true, false)
+        cfgs = Dict(s => _choose_stage(k, s, T, dim, t) for (s, t) in calibrate!(k, T; dim, n, force))
+        for (hb, hm) in _SPECIALISATIONS
             bins = [s => build_stage(k, s, T, dim, cfgs[s]; hasbias=hb, hasmask=hm) for s in tune_stages(k)]
             KernelDispatch.add_variant!(SDPA(), k, _attention_variant_key(k, T, dim, n; hasbias=hb, hasmask=hm);
                 bins...)
