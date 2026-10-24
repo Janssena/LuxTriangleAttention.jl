@@ -5,8 +5,9 @@
 # independent, so XLA schedules them concurrently and keeps every slice's scores live — measured to
 # give no memory win at all. `stablehlo.while` forces one slice at a time.
 #
-# What is pinned here is correctness: rolling must not change the result. Chunk sizes that do not
-# divide the axis must still work (they fall back to the unrolled form).
+# What is pinned here is correctness: rolling must not change the result, which is the native Julia layer's (the
+# traced Float32 layer is compared with it, chunked and not). Chunk sizes that do not divide the axis must still work
+# (they fall back to the unrolled form).
 
 using Reactant, Enzyme
 
@@ -35,6 +36,8 @@ using Reactant, Enzyme
             f(l, x, b, m, ps, st) = first(l(x, b, m, ps, st))
             cf_ref = @compile f(ref_layer, x_d, b_d, m_d, ps_d, st_d)
             y_ref = Array(cf_ref(ref_layer, x_d, b_d, m_d, ps_d, st_d))
+            y_native = first(ref_layer(x, b, m, ps, st))                # the native layer, on the host
+            @test y_ref ≈ y_native
 
             # 2 and 4 divide N (rolled path); 3 and 5 do not (unrolled fallback); N disables it.
             for cs in (2, 3, 4, 5, N)
@@ -42,6 +45,7 @@ using Reactant, Enzyme
                 cf = @compile f(l, x_d, b_d, m_d, ps_d, st_d)
                 y = Array(cf(l, x_d, b_d, m_d, ps_d, st_d))
                 @test y ≈ y_ref
+                @test y ≈ y_native
             end
         end
     end
@@ -85,7 +89,7 @@ using Reactant, Enzyme
     end
 
     # The point of rolling is to bound the REVERSE, so the reverse has to compile and agree with the
-    # unchunked gradient. It did not before `_sdpa_stable`: Enzyme's reverse of `NNlib.softmax`'s
+    # unchunked gradient. It did not before `_sdpa_enzyme_safe`: Enzyme's reverse of `NNlib.softmax`'s
     # max-reduce inside a `stablehlo.while` fails MLIR verification.
     @testset "rolled reverse matches unchunked" begin
         vz = randn(rng, T, chn, N, N, B)
@@ -104,7 +108,7 @@ using Reactant, Enzyme
         try
             Reactant.Compiler.WHILE_UNROLL_THRESHOLD[] = 0
             opts = LuxTriangleAttention.chunked_compile_options()
-            # This works only because the rolled path routes through the extension's `_sdpa_stable`
+            # This works only because the rolled path routes through the extension's `_sdpa_enzyme_safe`
             # shadow of LuxLib's ReactantExt SDPA, whose softmax max is `ignore_derivatives`-wrapped.
             # With LuxLib's own softmax the reverse fails MLIR verification outright.
             l = Attention(chn, head_dim, num_heads; bias_layout=:qk, chunk_size=2)
@@ -133,23 +137,27 @@ using Reactant, Enzyme
         g(l, x, m, ps, st) = first(l(x, m, ps, st))
         cf_ref = @compile g(ref, x_d, m_d, ps_d, st_d)
         y_ref = Array(cf_ref(ref, x_d, m_d, ps_d, st_d))
+        y_native = first(ref(x, mask, ps, st))
+        @test y_ref ≈ y_native
 
         for cs in (2, 4)
             l = TriangleAttention(chn, head_dim, num_heads; is_starting=true, chunk_size=cs)
             cf = @compile g(l, x_d, m_d, ps_d, st_d)
-            @test Array(cf(l, x_d, m_d, ps_d, st_d)) ≈ y_ref
+            y = Array(cf(l, x_d, m_d, ps_d, st_d))
+            @test y ≈ y_ref
+            @test y ≈ y_native
         end
     end
 end
 
-# `_sdpa_stable` is `_sdpa_default` with the softmax written out so the max-subtraction can be marked
-# non-differentiable — see its docstring in `ext/reactant/chunk.jl`. It is defined ONLY in this
+# `_sdpa_enzyme_safe` is `_sdpa_default` with the softmax written out so the max-subtraction can be marked
+# non-differentiable — see its docstring in `ext/LuxTriangleAttentionReactantExt/chunk.jl`. It is defined ONLY in this
 # extension (nothing in the base package calls it), so this pins the equivalence the rolled loop
 # above depends on: the traced, differentiation-safe rewrite must compute the same VALUES as ordinary
 # attention, on `AnyTracedRArray` — the only type it has a method for.
 const RX = Base.get_extension(LuxTriangleAttention, :LuxTriangleAttentionReactantExt)
 
-@testset "_sdpa_stable matches _sdpa_default" begin
+@testset "_sdpa_enzyme_safe matches _sdpa_default" begin
     rng = Random.Xoshiro(7)
     dev = Reactant.to_rarray
     for T in (Float64, Float32), rank in (4, 5)
@@ -159,10 +167,50 @@ const RX = Base.get_extension(LuxTriangleAttention, :LuxTriangleAttentionReactan
         a = LuxTriangleAttention._sdpa_default(q, k, v, nothing, nothing)
 
         qd, kd, vd = dev(q), dev(k), dev(v)
-        f(q, k, v) = RX._sdpa_stable(q, k, v, nothing, nothing)
+        f(q, k, v) = RX._sdpa_enzyme_safe(q, k, v, nothing, nothing)
         b = Array(@jit f(qd, kd, vd))
 
         @test size(a) == size(b)
         @test a ≈ b
+    end
+end
+
+# The rolled path (`_sdpa_enzyme_safe`) in 16 bit, compiled. It scales q explicitly and runs `dot_general` in
+# the input type, so the same logit overflow as `test/layers/attention.test.jl`'s applies, and its
+# masked logits are `typemin` (-Inf). Written before the fixes: a failure is a finding.
+@testset "chunked attention, 16-bit (compiled)" begin
+    dev = Reactant.to_rarray
+    f(l, x, b, m, ps, st) = first(l(x, b, m, ps, st))
+
+    @testset "logits beyond Float16 before the 1/√d scale, chunk_size=$cs" for cs in (4, 8)
+        # A PAIR input: chunking slices dim 4 (`Nj`), which a `[C, N, B]` sequence does not have. N = 8:
+        # chunk_size 4 rolls, 8 is the unchunked fallback.
+        c = f16_overflow_attention(Random.Xoshiro(1); pair=true)
+        l = Attention(16, 16, 2; chunk_size=cs)
+        y64, _ = l(c.x64, c.ps64, c.st64)
+        cf = @compile f(l, dev(c.x16), nothing, nothing, dev(c.ps16), dev(c.st16))
+        y16 = Array(cf(l, dev(c.x16), nothing, nothing, dev(c.ps16), dev(c.st16)))
+        if cs == 4
+            # The rolled path (`_sdpa_enzyme_safe`): runs a Float16 chunk in Float32.
+            @test all(isfinite, y16)
+            @test relerr(y16, y64) < 2.0e-2
+        else
+            # `chunk_size >= N`: nothing to chunk, so this is LuxLib's own traced SDPA (the unchunked
+            # layer), which is not Float16-safe under Reactant and is not meant for production (it
+            # materialises every score). Pinned as broken so a LuxLib fix shows up.
+            @test_broken all(isfinite, y16)
+        end
+    end
+
+    @testset "fully masked key set is finite, $T, chunk_size=4" for T in (Float32, Float16)
+        rng = Random.Xoshiro(2)
+        chn, N, B = 16, 8, 1
+        l = Attention(chn, 8, 2; bias_layout=:qk, chunk_size=4)
+        ps, st = Lux.setup(rng, l) |> convert_types(T)
+        x = T.(randn(rng, Float32, chn, N, N, B))
+        mask = fill(true, N, N, B); mask[:, 3, :] .= false
+        cf = @compile f(l, dev(x), nothing, dev(mask), dev(ps), dev(st))
+        y = Array(cf(l, dev(x), nothing, dev(mask), dev(ps), dev(st)))
+        @test all(isfinite, y)
     end
 end

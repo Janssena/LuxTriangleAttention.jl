@@ -1,29 +1,28 @@
-# The backend seams in `src/kernels/device.jl`, with NO backend extension loaded.
+# The backend hooks in `src/kernels/device.jl`, with NO backend extension loaded.
 #
-# Everything here is a `Ref{Function}` a backend extension installs in its own `__init__`, or a
-# `function foo end` with zero methods until one does. Run before `using Metal` appears anywhere
-# in the suite (`test/kernels/runtests.jl` is included ahead of `test/ext/`), so what is under test
-# is genuinely the UNINSTALLED default — a stub that fails loudly, not one that happens to have
-# nothing to report. `test/ext/metal/*.test.jl` covers the seams once Metal DOES install them.
+# Each hook is a method on KernelDispatch' backend tags that a backend extension adds for its own tag.
+# Run before `using Metal` appears anywhere in the suite (it is the first unit of `test/kernels/runtests.jl`, and a
+# `cpu` or `device` run never loads a backend at all), so what is under test is genuinely the UNINSTALLED default — an error that
+# names what to load, not a stub that happens to have nothing to report. `test/ext/metal/`
+# covers the hooks once Metal adds them.
 
-@testset "device seams, no backend loaded" begin
-    @test LuxTriangleAttention.device_kernel_available() == false
+@testset "device hooks, no backend loaded" begin
+    L = LuxTriangleAttention
+    @test L.device_kernel_available() == false
+    tag = L.KernelDispatch.MetalBackendTag()
+    @test_throws ArgumentError L.device_caps(tag)
+    @test_throws ArgumentError L.to_device(tag, zeros(Float32, 2))
 
-    @test_throws ErrorException LuxTriangleAttention.device_binary(Float32, 32, 128, 64)
-    @test_throws ErrorException LuxTriangleAttention.device_binary_bwd(Float32, 32, 128, 64)
+    # Building needs the one loaded device backend: none, so KernelDispatch refuses.
+    for stage in L.FLASH_STAGES
+        @test_throws ArgumentError L.build_stage(L.FlashScalar(), stage, Float32, 32, (; tg=128, kt=64, sb=1))
+    end
 
-    # Declared as `function calibrate! end` / `function _sdpa_kernel_bwd! end` — zero methods until
-    # a backend extension adds one, so calling either is an ordinary dispatch failure, not a
-    # message this package wrote.
-    @test_throws MethodError LuxTriangleAttention.calibrate!(Float32; dim=32)
-    @test_throws MethodError LuxTriangleAttention._sdpa_kernel_bwd!(
-        rand(Float32, 4, 4), rand(Float32, 4, 4), rand(Float32, 4, 4),
-        nothing, rand(Float32, 4, 4), rand(Float32, 4, 4), rand(Float32, 4, 4),
-        rand(Float32, 4, 4))
-
-    # `tune_flash_kernel!` checks `device_kernel_available()` itself before doing anything else, so
-    # its failure here is this package's own message, not a bare `MethodError`.
-    @test_throws ErrorException LuxTriangleAttention.tune_flash_kernel!(64; dim=32)
+    # Calibrating and tuning check `device_kernel_available()` first: this package's own message.
+    @test_throws ErrorException L.calibrate!(Float32; dim=32)
+    @test_throws ErrorException L.calibrate_mma!(Float32; dim=32)
+    @test_throws ErrorException L.tune_flash_kernel!(64; dim=32)
+    @test_throws ErrorException L.tune_flash_mma!(64; dim=32)
 end
 
 @testset "kernel_source_tag" begin

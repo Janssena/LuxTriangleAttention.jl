@@ -1,7 +1,6 @@
-# The SAME backward as `test/kernels/flash/backward.test.jl`, reached the OTHER way: as the reverse
+# The SAME backward as `test/kernels/flash/backward.gpu.test.jl`, reached the OTHER way: as the reverse
 # rule on a `stablehlo.custom_call`, via the Reactant extension's traced registry-entry launcher
-# (`_sdpa_kernel_launch` / `_traced_reverse` in `ext/LuxTriangleAttentionReactantExt.jl`). Lives under
-# `test/ext/reactant/` rather than `test/kernels/` because what is under test here is the
+# (`launch_forward!` / `traced_reverse` in KernelDispatch' `ext/KernelDispatchReactantExt.jl`). It runs only with a GPU, traced to its client (jax-mps for Metal). What is under test here is the
 # EXTENSION's own machinery — the LTA-layout <-> kernel-layout reversals, the operand ORDER in the
 # buffer table, the `(output, lse)` results being fed back in as the reverse's own operands, and the
 # `enzyme.reverse` attribute actually landing on the call — not the kernel math itself, which the
@@ -16,11 +15,9 @@
 # the only thing left resting on the unreleased pass is whether Enzyme calls it (which that pass
 # verifies by signature, so it is a loud failure rather than a silent one).
 
-using Test, Random, Reactant, Metal
-include(joinpath(@__DIR__, "..", "..", "mps_client.jl"))
-include(joinpath(@__DIR__, "..", "..", "ir_utils.jl"))   # reverse_symbol, reverse_signature
+using Test, Random, Reactant
 
-const _MPS = mps_client()
+const _MPS = traced_client()
 
 if _MPS === nothing
     @warn "jax-mps Metal PJRT plugin not found; skipping traced device-kernel tests" maxlog = 1
@@ -45,20 +42,19 @@ else
 
         # `_ensure_variant` refuses to tune the `:default` kernel mid-trace (compiling it is eager
         # device work the tracer would otherwise capture — see its docstring in
-        # `src/kernels/backend.jl`) and throws instead. Tuned explicitly here, ahead of any `@jit`
+        # `src/kernels/sdpa_op.jl`) and throws instead. Tuned explicitly here, ahead of any `@jit`
         # call below, rather than relying on some earlier test file having already done it as a side
         # effect — that dependency is real (`Metal`'s in-memory kernel registry persists for the rest
-        # of the process either way) but fragile to lean on across files. `Metal` must already be
-        # loaded for `tune_flash_kernel!` to find a backend; `test/ext/metal/*.test.jl` guarantees
-        # that earlier in `test/ext/runtests.jl`.
-        Metal.functional() && LuxTriangleAttention.tune_flash_kernel!(N; dim=hd, T)
+        # of the process either way) but fragile to lean on across files. `Metal` has to be
+        # loaded for `tune_flash_kernel!` to find a backend, which `using Metal` above does.
+        GPU !== nothing && LuxTriangleAttention.tune_flash_kernel!(N; dim=hd, T)
 
         dev = Reactant.to_rarray
         qd, kd, vd, biasd, maskd = dev(q), dev(k), dev(v), dev(bias), dev(mask)
 
         @testset "forward parity" begin
-            fo(q, k, v, m, b) = first(LuxTriangleAttention._sdpa_kernel(q, k, v, m, b))
-            fl(q, k, v, m, b) = last(LuxTriangleAttention._sdpa_kernel(q, k, v, m, b))
+            fo(q, k, v, m, b) = first(LuxTriangleAttention.SDPA()(q, k, v, m, b))
+            fl(q, k, v, m, b) = last(LuxTriangleAttention.SDPA()(q, k, v, m, b))
 
             ref = LuxTriangleAttention._sdpa_default(q, k, v, mask, bias)
             _, ref_lse = reference_sdpa(q, k, v, mask, bias)
@@ -69,13 +65,13 @@ else
 
         @testset "forward parity, mask varies per batch element (B > 1)" begin
             # This entry point already builds a full `[B,Nj,Nq]` mask buffer for both branches (see
-            # `_sdpa_kernel_launch`'s docstring), so this is purely a kernel-addressing regression
+            # KernelDispatch' `launch_forward!`), so this is purely a kernel-addressing regression
             # test: before `mheads` existed, `bh ÷ nh` used the WRONG stride here (`nh = H`, giving
             # `bh ÷ H` the batch index only by the coincidence that `nh` and the true head count are
             # equal for this traced path) — this test does not distinguish that coincidence from a
-            # real fix, but the direct-Metal equivalent in `test/ext/metal/launch.test.jl` does,
+            # real fix, but the direct-Metal equivalent in `test/kernels/launch.gpu.test.jl` does,
             # since there `nh = 1` and only `mheads` can recover the batch index.
-            fo2(q, k, v, m, b) = first(LuxTriangleAttention._sdpa_kernel(q, k, v, m, b))
+            fo2(q, k, v, m, b) = first(LuxTriangleAttention.SDPA()(q, k, v, m, b))
             B2 = 2
             q2 = randn(rng, T, hd, H, N, N, B2)
             k2 = randn(rng, T, hd, H, N, N, B2)
@@ -93,16 +89,16 @@ else
         end
 
         @testset "reverse rule parity" begin
-            # `_sdpa_kernel_bwd!` takes and returns LuxTriangleAttention-layout arrays, converting
+            # `sdpa_bwd` takes and returns LuxTriangleAttention-layout arrays, converting
             # into the kernel's layout internally — so the harness hands it exactly what the forward
             # produced and compares the result directly against a host VJP. This is the same walk
             # over the same entry stages that the `enzyme.reverse` function performs; only the entry
             # point differs.
             function rev(q, k, v, mask, bias)
-                o, lse = LuxTriangleAttention._sdpa_kernel(q, k, v, mask, bias)
+                o, lse = LuxTriangleAttention.SDPA()(q, k, v, mask, bias)
                 # dO = 1 makes this the VJP of `loss = sum(o)`.
                 dO = Reactant.Ops.fill(1.0f0, size(q))
-                dq, dk, dv, db = LuxTriangleAttention._sdpa_kernel_bwd!(
+                dq, dk, dv, db = sdpa_bwd(
                     q, k, v, mask, bias, o, lse, dO)
                 return (dq, dk, dv, reshape(db, size(bias)))
             end
@@ -132,14 +128,14 @@ else
             mr[Nq, :, :, Nj, :] .= false
             qrd, krd, vrd, brd, mrd = dev(qr), dev(kr), dev(vr), dev(br), dev(mr)
 
-            fo(q, k, v, m, b) = first(LuxTriangleAttention._sdpa_kernel(q, k, v, m, b))
+            fo(q, k, v, m, b) = first(LuxTriangleAttention.SDPA()(q, k, v, m, b))
             @test Array(@jit fo(qrd, krd, vrd, mrd, brd)) ≈
                   LuxTriangleAttention._sdpa_default(qr, kr, vr, mr, br) rtol = 1.0f-5
 
             function rev(q, k, v, mask, bias)
-                o, lse = LuxTriangleAttention._sdpa_kernel(q, k, v, mask, bias)
+                o, lse = LuxTriangleAttention.SDPA()(q, k, v, mask, bias)
                 dO = Reactant.Ops.fill(1.0f0, size(q))
-                dq, dk, dv, db = LuxTriangleAttention._sdpa_kernel_bwd!(
+                dq, dk, dv, db = sdpa_bwd(
                     q, k, v, mask, bias, o, lse, dO)
                 return (dq, dk, dv, reshape(db, size(bias)))
             end
@@ -151,7 +147,7 @@ else
             # jax-mps allocates custom-call outputs uninitialised (a bare `allocator::malloc` in
             # metal_kernel_lib.cc). Without the `"zero_init"` flag `_emit_stage` puts on the `dbias`
             # result, `dbias` lands on top of whatever memory MLX recycled — the square case above
-            # passed only when that memory happened to be fresh. See docs/BUG_traced_dbias.md.
+            # passed only when that memory happened to be fresh. See docs/done/BUG_traced_dbias.md.
             for (i, j, nm) in ((1, 1, "dq"), (2, 2, "dk"), (3, 3, "dv"), (4, 5, "dbias"))
                 @testset "$nm" begin
                     @test got[i] ≈ Array(want[j]) rtol = 1.0f-4 atol = 1.0f-5
@@ -159,28 +155,22 @@ else
             end
         end
 
-        @testset "reverse rule is attached to the forward call" begin
-            # The structural half: the numerics above prove the rule COMPUTES the right thing, this
-            # proves the forward custom_call actually carries it, with the convention Enzyme-JAX's
-            # custom-call rule checks. (`test/ext/reactant/custom_call.test.jl` pins the same
-            # convention against a mock, on any backend and with no Metal.)
-            fwd(q, k, v, m, b) = first(LuxTriangleAttention._sdpa_kernel(q, k, v, m, b))
-            ir = repr(Reactant.@code_hlo optimize = false donated_args = :none fwd(
+        @testset "the traced backward zero-fills the accumulated dbias" begin
+            # `flash_bwd_dq!` ACCUMULATES `dbias` with atomics and jax-mps hands custom-call results
+            # over uninitialised, so the backward's `dbias` result must ask for `zero_init`
+            # (docs/done/BUG_traced_dbias.md). The numbers above can pass by luck on fresh memory;
+            # this pins the flag itself. (Attaching the backward to the FORWARD call as an
+            # `enzyme.reverse` function was dropped with the KernelDispatch slimming: Enzyme-JAX does not
+            # honour it, and a traced gradient through a kernel throws instead.)
+            function bwd(q, k, v, mask, bias)
+                o, lse = LuxTriangleAttention.SDPA()(q, k, v, mask, bias)
+                sdpa_bwd(q, k, v, mask, bias, o, lse,
+                    Reactant.Ops.fill(1.0f0, size(q)))
+            end
+            ir = repr(Reactant.@code_hlo optimize = false donated_args = :none bwd(
                 qd, kd, vd, maskd, biasd))
-
-            @test occursin("enzyme.reverse = @", ir)
-            # q, k, v, bias are differentiable; the i1 mask (operand 4) is deliberately not.
-            @test occursin("enzyme.active_operands = array<i64: 0, 1, 2, 3>", ir)
-            # 5 primal operands + 2 primal results + 2 result cotangents -> 4 cotangents.
-            @test reverse_signature(ir) == (9, 4)
-            # The rule body is the three backward stages (dq+dbias, dk, dv), as three more
-            # custom_calls; `>= 2` rather than pinning the exact count so an implementation change in
-            # how the stages split does not make this test the first thing to break.
-            sym = reverse_symbol(ir)
-            body = ir[findfirst(sym, ir)[1]:end]
-            @test length(collect(eachmatch(r"stablehlo\.custom_call", body))) >= 2
-            # ...and the accumulated `dbias` result asks jax-mps to zero it first.
-            @test occursin("zero_init", body)
+            @test length(collect(eachmatch(r"mps\.metal_kernel_lib", ir))) == 4   # fwd + dq, dk, dv
+            @test occursin("zero_init", ir)
         end
     end
 
