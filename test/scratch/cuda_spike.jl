@@ -44,8 +44,13 @@ let caps = LTA.device_caps(KD.device_backend()), k = LTA.FlashScalar()
             b = LTA.build_stage(k, stage, T, 32, p; hasbias=hb, hasmask=hm)
             note("$T :$stage hb=$hb hm=$hm $(p)", true, "max threads of the binary: $(KD.max_threads(b))")
         catch err
-            note("$T :$stage hb=$hb hm=$hm $(p)", false, sprint(showerror, err))
-            println("          ", first(split(sprint(showerror, err), '\n'), 1)...)
+            # The refusal lists WHY ("Reason:" lines); print them in full once per stage (Float32, bias+mask), and
+            # only the name for the other builds.
+            full = sprint(showerror, err)
+            note("$T :$stage hb=$hb hm=$hm $(p)", false)
+            if T === Float32 && hb
+                println("      ", replace(full, "\n" => "\n      "))
+            end
         end
     end
 end
