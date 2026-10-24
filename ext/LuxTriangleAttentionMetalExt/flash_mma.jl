@@ -10,7 +10,10 @@ const _F16x64 = NTuple{64,VecElement{Float16}}
 const _BF16x64 = NTuple{64,VecElement{Metal.BFloat16}}
 const _F32x64 = NTuple{64,VecElement{Float32}}
 
-@inline LTA._mma_load(::MetalBackendTag, a, r, c) = simdgroup_load(a, (Int(r), Int(c)))
+# An 8×8×8 product, one row slot per lane. `A` and `B` operands are read alike: the block of the array.
+LTA._mma_shape(::MetalBackendTag) = (8, 8, 8)
+@inline LTA._mma_load_a(::MetalBackendTag, a, r, c) = simdgroup_load(a, (Int(r), Int(c)))
+@inline LTA._mma_load_b(::MetalBackendTag, a, r, c) = simdgroup_load(a, (Int(r), Int(c)))
 @inline LTA._mma_zero(::MetalBackendTag, ::Type{E}) where {E} = simdgroup_matrix_init_filled(zero(E))
 # BFloat16 fragments from REGISTER values (the P / dS operands at `ops = BFloat16`): NOT supported by
 # Apple's compiler for the M1 GPU (AGXMetalG13X). It only handles a bfloat fragment that comes from a
@@ -40,8 +43,8 @@ end
     llvmcall, _F32x64, (_BF16x64, _BF16x64, _F32x64), a, b, c)
 
 # A lane's two entries are elements 1 and 2 of its 64-wide vector; see the layout below.
-@inline LTA._mma_pair(::MetalBackendTag, f) = (Float32(f[1].value), Float32(f[2].value))
-@inline LTA._mma_setpair(::MetalBackendTag, f::NTuple{64,VecElement{E}}, x, y) where {E} =
+@inline LTA._mma_pair(::MetalBackendTag, f, ::Integer) = (Float32(f[1].value), Float32(f[2].value))
+@inline LTA._mma_setpair(::MetalBackendTag, f::NTuple{64,VecElement{E}}, ::Integer, x, y) where {E} =
     ntuple(i -> i == 1 ? VecElement{E}(E(x)) : i == 2 ? VecElement{E}(E(y)) : f[i], Val(64))
 
 # Lane `l` (bits b4…b0) holds (row, col) and (row, col+1) with row = 4·b4 + 2·b2 + b1 and

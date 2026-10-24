@@ -36,4 +36,7 @@ end
 LTA._atomic_fadd!(ptr::Core.LLVMPtr{Float32,CUDACore.AS.Global}, idx::Integer, val::Float32) =
     CUDACore.atomic_add!(ptr + (Int(idx) - 1) * sizeof(Float32), val)
 
+# The matrix-unit kernel `:flash_mma`'s fragment hooks.
+include("LuxTriangleAttentionCUDAExt/flash_mma.jl")
+
 end # module
