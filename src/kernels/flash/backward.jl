@@ -70,8 +70,8 @@ location is fully overwritten, exactly as the forward writes `o`). With `HB = fa
     active = j < n
     js = active ? j : Int32(0)
 
-    hi = bh % nh
-    bi = bh ÷ nh
+    hi = _srem(bh, nh)
+    bi = _sdiv(bh, nh)
     nn = n * n
     row = (bi * nouter + i) * n
     hstep = nh * Int32(DIM)
@@ -168,8 +168,8 @@ has its staged `lse` set to `+floatmax`, which makes its `p` exactly zero: no br
     active = kk < n
     kks = active ? kk : Int32(0)
 
-    hi = bh % nh
-    bi = bh ÷ nh
+    hi = _srem(bh, nh)
+    bi = _sdiv(bh, nh)
     nn = n * n
     row = (bi * nouter + i) * n
     hstep = nh * Int32(DIM)
@@ -241,8 +241,8 @@ the register-pressure note in the file header. The `s`/`p` recomputed here dupli
     active = kk < n
     kks = active ? kk : Int32(0)
 
-    hi = bh % nh
-    bi = bh ÷ nh
+    hi = _srem(bh, nh)
+    bi = _sdiv(bh, nh)
     nn = n * n
     row = (bi * nouter + i) * n
     hstep = nh * Int32(DIM)

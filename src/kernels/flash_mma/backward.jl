@@ -101,12 +101,12 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
     sg = tid ÷ Int32(32)
     lane = tid % Int32(32)
     nkt = (n + Int32(BKV) - Int32(1)) ÷ Int32(BKV)
-    kt = g % nkt
-    rest = g ÷ nkt
-    i = rest % nouter
-    bh = rest ÷ nouter
-    hi = bh % nh
-    bi = bh ÷ nh
+    kt = _srem(g, nkt)
+    rest = _sdiv(g, nkt)
+    i = _srem(rest, nouter)
+    bh = _sdiv(rest, nouter)
+    hi = _srem(bh, nh)
+    bi = _sdiv(bh, nh)
     row = (bi * nouter + i) * n
     step = nh * Int32(DIM)
     base = row * step + hi * Int32(DIM)
@@ -180,7 +180,7 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
         end
         @synchronize
         Vf = _mma_rows(be, kst, r0, Val(R), Val(DIM ÷ 8))
-        live = _mma_live(mask, ((bh ÷ mheads) * nouter + i) * n, keys, n, Val(R), Val(HM))
+        live = _mma_live(mask, ((_sdiv(bh, mheads)) * nouter + i) * n, keys, n, Val(R), Val(HM))
         dK = _mma_zeros(be, Val(R), Val(DIM ÷ 8))
         dV = _mma_zeros(be, Val(R), Val(DIM ÷ 8))
 
@@ -297,12 +297,12 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
     sg = tid ÷ Int32(32)
     lane = tid % Int32(32)
     nqt = (n + Int32(BQ) - Int32(1)) ÷ Int32(BQ)
-    qt = g % nqt
-    rest = g ÷ nqt
-    i = rest % nouter
-    bh = rest ÷ nouter
-    hi = bh % nh
-    bi = bh ÷ nh
+    qt = _srem(g, nqt)
+    rest = _sdiv(g, nqt)
+    i = _srem(rest, nouter)
+    bh = _sdiv(rest, nouter)
+    hi = _srem(bh, nh)
+    bi = _sdiv(bh, nh)
     row = (bi * nouter + i) * n
     step = nh * Int32(DIM)
     base = row * step + hi * Int32(DIM)
@@ -311,7 +311,7 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
     fr, col = _mma_lane(be, lane)
     j0 = q0 + r0 + fr
     lrow = ((bi * nouter + i) * nh + hi) * n
-    mb = ((bh ÷ mheads) * nouter + i) * n
+    mb = ((_sdiv(bh, mheads)) * nouter + i) * n
 
     e = tid
     while e < Int32(BQ * DIM)

@@ -53,6 +53,12 @@ const _LN2 = Float32(0.6931471805599453)
 # a kernel; a conversion of a compile-time constant folds away and may stay `Int32(...)`.
 @inline _i32(x::Integer) = unsafe_trunc(Int32, x)
 
+# `÷` and `%` by a RUNTIME divisor check for zero (a `DivideError`) and refuse the same builds. The divisors in the
+# kernels (`nh`, `mheads`, `nouter`, the tile counts) are positive launch parameters, and the dividends are
+# non-negative indices, so the plain signed division and remainder give the same results.
+@inline _sdiv(a::T, b::T) where {T<:Signed} = Core.Intrinsics.sdiv_int(a, b)
+@inline _srem(a::T, b::T) where {T<:Signed} = Core.Intrinsics.srem_int(a, b)
+
 """
     flash_fwd!(o, lse, q, k, v, bias_t, mask, scale, neg_inf, n, nouter, nh, mheads,
         Val(T), Val(DIM), Val(TG), Val(KT), Val(SB), Val(HB), Val(HM))
@@ -145,8 +151,8 @@ buffer table, is the same for all four specialisations. `HB = HM = true` is the 
     # grows. Without this the traced path had to materialise packed copies of `q`, `k` and `v` and
     # transpose `o` back: four full-size buffers, which doubled the XLA path's device memory over
     # the direct one.
-    hi = bh % nh                      # head index within its batch element
-    bi = bh ÷ nh                      # batch element
+    hi = _srem(bh, nh)                      # head index within its batch element
+    bi = _sdiv(bh, nh)                      # batch element
     nn = n * n
     row = (bi * nouter + i) * n       # first query slot of this (batch, i) row
     hstep = nh * Int32(DIM)           # elements from one query slot to the next
@@ -158,7 +164,7 @@ buffer table, is the same for all four specialisations. `HB = HM = true` is the 
     # `nh` is not the true head count, which is exactly the packed `nh = 1` case, where `bh`
     # conflates heads and batch with no way to recover the split from `nh` alone. `mheads` is that
     # true head count, supplied separately, so `bh ÷ mheads` is always the real batch index.
-    mb = ((bh ÷ mheads) * nouter + i) * n
+    mb = ((_sdiv(bh, mheads)) * nouter + i) * n
     lrow = (bi * nouter + i) * nh + hi # `lse` has no channel axis, so it strides differently
 
     qv = _kscale(_kload(q, qb, Val(DIM)), scale * _LOG2E)

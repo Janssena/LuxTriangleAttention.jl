@@ -257,12 +257,12 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
     sg = tid ÷ Int32(32)
     lane = tid % Int32(32)
     nqt = (n + Int32(BQ) - Int32(1)) ÷ Int32(BQ)
-    qt = g % nqt
-    rest = g ÷ nqt
-    i = rest % nouter
-    bh = rest ÷ nouter
-    hi = bh % nh
-    bi = bh ÷ nh
+    qt = _srem(g, nqt)
+    rest = _sdiv(g, nqt)
+    i = _srem(rest, nouter)
+    bh = _sdiv(rest, nouter)
+    hi = _srem(bh, nh)
+    bi = _sdiv(bh, nh)
     row = (bi * nouter + i) * n
     step = nh * Int32(DIM)
     base = row * step + hi * Int32(DIM)
@@ -270,7 +270,7 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
     r0 = sg * Int32(8 * R)
     fr, col = _mma_lane(be, lane)
     j0 = q0 + r0 + fr                          # this lane's query in row block 1
-    mb = ((bh ÷ mheads) * nouter + i) * n
+    mb = ((_sdiv(bh, mheads)) * nouter + i) * n
 
     e = tid
     while e < Int32(BQ * DIM)
