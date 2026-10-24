@@ -59,12 +59,10 @@ location is fully overwritten, exactly as the forward writes `o`). With `HB = fa
     vs = @localmem T (DIM, KT)
     ms = @localmem Float32 (KT,)
 
-    gx, gy, gz = @index(Group, NTuple)
     tid = _i32(@index(Local, Linear))
 
-    jt = _i32((gx)) - Int32(1)
-    i = _i32((gy)) - Int32(1)
-    bh = _i32((gz)) - Int32(1)
+    # (query or key tile, outer index, batch * head), 0-based, decoded by hand from the linear group index
+    jt, i, bh = _group_ids(_i32(@index(Group, Linear)) - Int32(1), n, nouter, Val(TG))
     j = jt * Int32(TG) + tid - Int32(1)
 
     active = j < n
@@ -157,12 +155,10 @@ has its staged `lse` set to `+floatmax`, which makes its `p` exactly zero: no br
     lses = @localmem Float32 (KT,)
     deltas = @localmem Float32 (KT,)
 
-    gx, gy, gz = @index(Group, NTuple)
     tid = _i32(@index(Local, Linear))
 
-    ktile = _i32((gx)) - Int32(1)
-    i = _i32((gy)) - Int32(1)
-    bh = _i32((gz)) - Int32(1)
+    # (query or key tile, outer index, batch * head), 0-based, decoded by hand from the linear group index
+    ktile, i, bh = _group_ids(_i32(@index(Group, Linear)) - Int32(1), n, nouter, Val(TG))
     kk = ktile * Int32(TG) + tid - Int32(1)
 
     active = kk < n
@@ -230,12 +226,10 @@ the register-pressure note in the file header. The `s`/`p` recomputed here dupli
     dos = @localmem T (DIM, KT)
     lses = @localmem Float32 (KT,)
 
-    gx, gy, gz = @index(Group, NTuple)
     tid = _i32(@index(Local, Linear))
 
-    ktile = _i32((gx)) - Int32(1)
-    i = _i32((gy)) - Int32(1)
-    bh = _i32((gz)) - Int32(1)
+    # (query or key tile, outer index, batch * head), 0-based, decoded by hand from the linear group index
+    ktile, i, bh = _group_ids(_i32(@index(Group, Linear)) - Int32(1), n, nouter, Val(TG))
     kk = ktile * Int32(TG) + tid - Int32(1)
 
     active = kk < n

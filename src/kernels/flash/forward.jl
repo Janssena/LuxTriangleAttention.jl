@@ -17,8 +17,8 @@
 # it reads ONLY the x component and rebuilds N-D indices in software from the context's
 # iterspace. A native 3-D threadgroup grid is therefore inexpressible: y and z are silently
 # dropped, and the kernel writes exactly one (i, bh) slice while the rest of the output stays
-# untouched. So the grid is 1-D over `cld(N,TG) * N * heads` groups and `@index(Group, NTuple)`
-# does the decode. Check this first when bringing up another backend.
+# untouched. So the grid is 1-D over `cld(N,TG) * N * heads` groups and the kernel decodes the linear
+# `@index(Group, Linear)` itself (`_group_ids`). Check this first when bringing up another backend.
 #
 # ## 2. Data is passed as raw pointers, not device arrays
 #
@@ -58,6 +58,16 @@ const _LN2 = Float32(0.6931471805599453)
 # non-negative indices, so the plain signed division and remainder give the same results.
 @inline _sdiv(a::T, b::T) where {T<:Signed} = Core.Intrinsics.sdiv_int(a, b)
 @inline _srem(a::T, b::T) where {T<:Signed} = Core.Intrinsics.srem_int(a, b)
+
+# The 0-based (tile, outer index, batch·head) of the group with 0-based linear index `g`: the grid is 1-D over
+# `cld(n, TG) * nouter * heads` groups (see "The dispatch must be a 1-D grid" above), x fastest. Decoded by hand
+# rather than with `@index(Group, NTuple)`, whose backends rebuild it with checked integer division by runtime
+# sizes, which can throw (and a CUDA binary that can throw is refused).
+@inline function _group_ids(g, n, nouter, ::Val{TG}) where {TG}
+    nt = (n + Int32(TG) - Int32(1)) ÷ Int32(TG)
+    rest = _sdiv(g, nt)
+    return _srem(g, nt), _srem(rest, nouter), _sdiv(rest, nouter)
+end
 
 """
     flash_fwd!(o, lse, q, k, v, bias_t, mask, scale, neg_inf, n, nouter, nh, mheads,
@@ -131,12 +141,10 @@ buffer table, is the same for all four specialisations. `HB = HM = true` is the 
     vs = @localmem T (DIM, KT)
     ms = @localmem Float32 (KT,)
 
-    gx, gy, gz = @index(Group, NTuple)
     tid = _i32(@index(Local, Linear))
 
-    jt = _i32((gx)) - Int32(1)       # query tile
-    i = _i32((gy)) - Int32(1)        # outer index in `0:nouter-1`, one per group, by construction
-    bh = _i32((gz)) - Int32(1)       # batch * head
+    # (query or key tile, outer index, batch * head), 0-based, decoded by hand from the linear group index
+    jt, i, bh = _group_ids(_i32(@index(Group, Linear)) - Int32(1), n, nouter, Val(TG))
     j = jt * Int32(TG) + tid - Int32(1)
 
     active = j < n
