@@ -47,6 +47,12 @@
 const _LOG2E = Float32(1.4426950408889634)
 const _LN2 = Float32(0.6931471805599453)
 
+# `Int32(x)` of a runtime `Int64` (a KernelAbstractions index) can throw an `InexactError`, and a device binary built
+# without a runtime (KernelDispatch's CUDA binaries) is refused for any code that can throw. Group and thread
+# indices of one launch always fit, so the unchecked truncation is exact. Use it for every runtime conversion in
+# a kernel; a conversion of a compile-time constant folds away and may stay `Int32(...)`.
+@inline _i32(x::Integer) = unsafe_trunc(Int32, x)
+
 """
     flash_fwd!(o, lse, q, k, v, bias_t, mask, scale, neg_inf, n, nouter, nh, mheads,
         Val(T), Val(DIM), Val(TG), Val(KT), Val(SB), Val(HB), Val(HM))
@@ -120,11 +126,11 @@ buffer table, is the same for all four specialisations. `HB = HM = true` is the 
     ms = @localmem Float32 (KT,)
 
     gx, gy, gz = @index(Group, NTuple)
-    tid = Int32(@index(Local, Linear))
+    tid = _i32(@index(Local, Linear))
 
-    jt = Int32(gx) - Int32(1)       # query tile
-    i = Int32(gy) - Int32(1)        # outer index in `0:nouter-1`, one per group, by construction
-    bh = Int32(gz) - Int32(1)       # batch * head
+    jt = _i32((gx)) - Int32(1)       # query tile
+    i = _i32((gy)) - Int32(1)        # outer index in `0:nouter-1`, one per group, by construction
+    bh = _i32((gz)) - Int32(1)       # batch * head
     j = jt * Int32(TG) + tid - Int32(1)
 
     active = j < n

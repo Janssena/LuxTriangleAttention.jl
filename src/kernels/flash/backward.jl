@@ -60,11 +60,11 @@ location is fully overwritten, exactly as the forward writes `o`). With `HB = fa
     ms = @localmem Float32 (KT,)
 
     gx, gy, gz = @index(Group, NTuple)
-    tid = Int32(@index(Local, Linear))
+    tid = _i32(@index(Local, Linear))
 
-    jt = Int32(gx) - Int32(1)
-    i = Int32(gy) - Int32(1)
-    bh = Int32(gz) - Int32(1)
+    jt = _i32((gx)) - Int32(1)
+    i = _i32((gy)) - Int32(1)
+    bh = _i32((gz)) - Int32(1)
     j = jt * Int32(TG) + tid - Int32(1)
 
     active = j < n
@@ -158,11 +158,11 @@ has its staged `lse` set to `+floatmax`, which makes its `p` exactly zero: no br
     deltas = @localmem Float32 (KT,)
 
     gx, gy, gz = @index(Group, NTuple)
-    tid = Int32(@index(Local, Linear))
+    tid = _i32(@index(Local, Linear))
 
-    ktile = Int32(gx) - Int32(1)
-    i = Int32(gy) - Int32(1)
-    bh = Int32(gz) - Int32(1)
+    ktile = _i32((gx)) - Int32(1)
+    i = _i32((gy)) - Int32(1)
+    bh = _i32((gz)) - Int32(1)
     kk = ktile * Int32(TG) + tid - Int32(1)
 
     active = kk < n
@@ -231,11 +231,11 @@ the register-pressure note in the file header. The `s`/`p` recomputed here dupli
     lses = @localmem Float32 (KT,)
 
     gx, gy, gz = @index(Group, NTuple)
-    tid = Int32(@index(Local, Linear))
+    tid = _i32(@index(Local, Linear))
 
-    ktile = Int32(gx) - Int32(1)
-    i = Int32(gy) - Int32(1)
-    bh = Int32(gz) - Int32(1)
+    ktile = _i32((gx)) - Int32(1)
+    i = _i32((gy)) - Int32(1)
+    bh = _i32((gz)) - Int32(1)
     kk = ktile * Int32(TG) + tid - Int32(1)
 
     active = kk < n

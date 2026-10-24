@@ -252,8 +252,8 @@ and holds their `Q` fragments for the whole call. Per key tile of `BK` keys the 
     ms = @localmem Float32 (BK,)
 
     NT = Int32(32 * NSG)
-    g = Int32(@index(Group, Linear)) - Int32(1)
-    tid = Int32(@index(Local, Linear)) - Int32(1)
+    g = _i32(@index(Group, Linear)) - Int32(1)
+    tid = _i32(@index(Local, Linear)) - Int32(1)
     sg = tid ÷ Int32(32)
     lane = tid % Int32(32)
     nqt = (n + Int32(BQ) - Int32(1)) ÷ Int32(BQ)
