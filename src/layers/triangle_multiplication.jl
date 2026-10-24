@@ -1,16 +1,28 @@
-"""
+@doc raw"""
     TriangleMultiplication(chn_in, chn_hidden; is_outgoing=true, kwargs...)
 
-Implementation of Triangle Multiplication (Algorithm 11 & 12 from AlphaFold2).
-Updates the pair representation by combining edges sharing a common node.
+Implementation of Triangle Multiplication (AlphaFold2 Algorithms 11 & 12).
+Updates the pair representation by combining edges sharing a common node. AlphaFold2 Algorithm 11
+(outgoing edges) is
+
+```math
+\begin{aligned}
+z_{ij} &\leftarrow \mathrm{LayerNorm}(z_{ij}) \\
+a_{ij},\, b_{ij} &= \mathrm{sigmoid}\big(\mathrm{Linear}(z_{ij})\big) \odot \mathrm{Linear}(z_{ij}) \\
+g_{ij} &= \mathrm{sigmoid}\big(\mathrm{Linear}(z_{ij})\big) \\
+\tilde{z}_{ij} &= g_{ij} \odot \mathrm{Linear}\Big(\mathrm{LayerNorm}\big(\textstyle\sum_k a_{ik} \odot b_{jk}\big)\Big)
+\end{aligned}
+```
+
+and AlphaFold2 Algorithm 12 (incoming edges) sums ``a_{ki} \odot b_{kj}`` instead.
 
 ## Arguments
 - `chn_in`: Input channels.
 - `chn_hidden`: Hidden channels for internal projections.
 
 ## Keyword Arguments
-- `is_outgoing`: If `true`, performs "Outgoing" multiplication (Algorithm 11). 
-  If `false`, performs "Incoming" multiplication (Algorithm 12).
+- `is_outgoing`: If `true`, performs "Outgoing" multiplication (AlphaFold2 Algorithm 11).
+  If `false`, performs "Incoming" multiplication (AlphaFold2 Algorithm 12).
 - `layernorm_eps`: Epsilon for LayerNorm.
 - `rank`: The rank (ndims) of the input.
 - `kwargs...`: Passed to `TriMulCore`.

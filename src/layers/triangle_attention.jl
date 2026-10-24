@@ -1,8 +1,24 @@
-"""
+@doc raw"""
     TriangleAttention(chn_in, head_dim, num_heads; is_starting=true, kwargs...)
 
-Implementation of Triangle Attention (Algorithm 13 & 14 from AlphaFold2).
-Updates the pair representation by performing axial attention with a triangle bias.
+Implementation of Triangle Attention (AlphaFold2 Algorithms 13 & 14).
+Updates the pair representation by performing axial attention with a triangle bias. Per head ``h``,
+AlphaFold2 Algorithm 13 (starting node) is
+
+```math
+\begin{aligned}
+z_{ij} &\leftarrow \mathrm{LayerNorm}(z_{ij}) \\
+q^h_{ij},\, k^h_{ij},\, v^h_{ij} &= \mathrm{LinearNoBias}(z_{ij}) \qquad
+b^h_{ij} = \mathrm{LinearNoBias}(z_{ij}) \qquad
+g^h_{ij} = \mathrm{sigmoid}\big(\mathrm{Linear}(z_{ij})\big) \\
+a^h_{ijk} &= \mathrm{softmax}_k\Big(\tfrac{1}{\sqrt{c}}\, {q^h_{ij}}^{\top} k^h_{ik} + b^h_{jk}\Big) \\
+o^h_{ij} &= g^h_{ij} \odot \sum_k a^h_{ijk}\, v^h_{ik} \\
+\tilde{z}_{ij} &= \mathrm{Linear}\big(\mathrm{concat}_h(o^h_{ij})\big)
+\end{aligned}
+```
+
+and AlphaFold2 Algorithm 14 (ending node) uses ``k^h_{kj}``, ``b^h_{ki}`` and ``v^h_{kj}`` in place of
+``k^h_{ik}``, ``b^h_{jk}`` and ``v^h_{ik}``. ``c`` is `head_dim`.
 
 ## Arguments
 - `chn_in`: Input channels.
@@ -10,8 +26,8 @@ Updates the pair representation by performing axial attention with a triangle bi
 - `num_heads`: Number of attention heads.
 
 ## Keyword Arguments
-- `is_starting`: If `true`, performs "Starting Node" attention (Algorithm 13). 
-  If `false`, performs "Ending Node" attention (Algorithm 14).
+- `is_starting`: If `true`, performs "Starting Node" attention (AlphaFold2 Algorithm 13).
+  If `false`, performs "Ending Node" attention (AlphaFold2 Algorithm 14).
 - `use_bias`: Boolean or NamedTuple for internal layer biases.
 - `layernorm_eps`: Epsilon for LayerNorm.
 - `rank`: The rank (ndims) of the input.

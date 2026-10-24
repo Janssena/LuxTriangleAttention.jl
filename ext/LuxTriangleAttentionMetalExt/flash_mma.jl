@@ -45,7 +45,7 @@ end
     ntuple(i -> i == 1 ? VecElement{E}(E(x)) : i == 2 ? VecElement{E}(E(y)) : f[i], Val(64))
 
 # Lane `l` (bits b4…b0) holds (row, col) and (row, col+1) with row = 4·b4 + 2·b2 + b1 and
-# col = 4·b3 + 2·b0 — measured (test/ext/metal/flash_mma_lane.test.jl), and the mapping MLX's
+# col = 4·b3 + 2·b0 — measured (test/ext/metal/flash_mma.test.jl), and the mapping MLX's
 # kernels rely on. The four lanes of a row differ in bits 0 and 3, hence the xor masks 1 and 8.
 @inline LTA._mma_lane(::MetalBackendTag, lane) =
     (Int32(4) * ((lane >> 4) & Int32(1)) + Int32(2) * ((lane >> 2) & Int32(1)) + ((lane >> 1) & Int32(1)),

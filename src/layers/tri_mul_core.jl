@@ -130,9 +130,9 @@ function _layer_norm_out_f32(m, y_tok, ps, ε, ::Type{T}) where {T}
     return layernorm_f32stats(y_tok, γ, β, m.layer_norm_out.layer.layer.activation, 2, ε, T)
 end
 
-# Outgoing (Alg 11): X[i, j] = Σ_k a[i, k] b[j, k]  →  A · Bᵀ per plane
+# Outgoing (AlphaFold2 Alg 11): X[i, j] = Σ_k a[i, k] b[j, k]  →  A · Bᵀ per plane
 _contract(::True, a, b) = Lux.batched_matmul(a, Lux.batched_transpose(b))
-# Incoming (Alg 12): X[i, j] = Σ_k a[k, i] b[k, j]  →  Aᵀ · B per plane
+# Incoming (AlphaFold2 Alg 12): X[i, j] = Σ_k a[k, i] b[k, j]  →  Aᵀ · B per plane
 _contract(::False, a, b) = Lux.batched_matmul(Lux.batched_transpose(a), b)
 
 """

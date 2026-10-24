@@ -28,7 +28,7 @@ LuxTriangleAttention.ending_permute(mask::AnyTracedRArray{Bool,3}) =
     LuxTriangleAttention._layernorm_f32stats(m.layer, x, ps, st), st
 
 # The rolled `@trace` chunking path (`_sdpa_enzyme_safe`, `chunked_compile_options`, `check_rolled`,
-# `_chunked_sdpa` and its helpers) lives in `ext/reactant/chunk.jl`.
+# `_chunked_sdpa` and its helpers) lives in `ext/LuxTriangleAttentionReactantExt/chunk.jl`.
 include("LuxTriangleAttentionReactantExt/chunk.jl")
 
 end # module LuxTriangleAttentionReactantExt

@@ -30,7 +30,7 @@
 # The algorithm assumes the fragment shape every hook speaks: an 8×8 fragment in which each of a
 # 32-lane SIMD group's lanes holds TWO ADJACENT ENTRIES OF ONE ROW, so the four lanes holding a row
 # can reduce it with shuffles (`_mma_rowmax`/`_mma_rowsum`). Apple's simdgroup matrices are laid out
-# this way (measured: `test/ext/metal/flash_mma_lane.test.jl`); so is the accumulator of NVIDIA's
+# this way (measured: `test/ext/metal/flash_mma.test.jl`); so is the accumulator of NVIDIA's
 # `mma.sync` m16n8, row for row, which is what a CUDA port would implement the hooks with.
 #
 # ## Why the softmax runs in registers

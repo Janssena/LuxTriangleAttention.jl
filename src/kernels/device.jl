@@ -57,7 +57,7 @@ The kernels are written generically over the storage type (accumulation is alway
 note 3 in `src/kernels/flash/forward.jl`). A dtype is listed only after the reference comparison has
 run at it: a path that has only ever been executed at `Float32` is untested, not working. `Float16` and
 `BFloat16` (BFloat16s.jl's, the type Metal.jl and Reactant use) are checked against the reference on
-upcast inputs, on the eager and traced paths (`test/ext/metal/launch.test.jl`,
+upcast inputs, on the eager and traced paths (`test/kernels/launch.gpu.test.jl`,
 `test/ext/reactant/attention_kernel.test.jl`). They are the precisions KernelDispatch 0.2 supports
 (eagerly, from a trace, and in launches that mix them), and its signature check refuses a launch whose
 buffers are not of the type the binary was compiled for.
