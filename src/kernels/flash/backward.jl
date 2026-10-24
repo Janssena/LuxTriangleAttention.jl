@@ -76,7 +76,7 @@ location is fully overwritten, exactly as the forward writes `o`). With `HB = fa
     qb = (row + js) * hstep + hi * Int32(DIM)
     kb = row * hstep + hi * Int32(DIM)
     btb = bh * nn + js                        # bias_t / dbias_t: (js, kk) at btb + kk * n
-    mb = ((bh ÷ mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
+    mb = (_sdiv(bh, mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
     lb = ((bi * nouter + i) * nh + hi) * n + js + Int32(1)
 
     qv = _kscale(_kload(q, qb, Val(DIM)), scale * _LOG2E)
@@ -171,7 +171,7 @@ has its staged `lse` set to `+floatmax`, which makes its `p` exactly zero: no br
     hstep = nh * Int32(DIM)
     kb = (row + kks) * hstep + hi * Int32(DIM)
     qb0 = row * hstep + hi * Int32(DIM)
-    mb = ((bh ÷ mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
+    mb = (_sdiv(bh, mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
     lrow = (bi * nouter + i) * nh + hi
 
     masked = active ? (HM ? unsafe_load(mask, mb + kks + Int32(1)) : false) : true
@@ -242,7 +242,7 @@ the register-pressure note in the file header. The `s`/`p` recomputed here dupli
     hstep = nh * Int32(DIM)
     kb = (row + kks) * hstep + hi * Int32(DIM)
     qb0 = row * hstep + hi * Int32(DIM)
-    mb = ((bh ÷ mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
+    mb = (_sdiv(bh, mheads) * nouter + i) * n     # see `flash_fwd!` for why this is not `bi * nn`
     lrow = (bi * nouter + i) * nh + hi
 
     masked = active ? (HM ? unsafe_load(mask, mb + kks + Int32(1)) : false) : true
