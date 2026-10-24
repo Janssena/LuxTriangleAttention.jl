@@ -13,6 +13,7 @@ end
 
 selected("ext_cuda"; backend=:gpu) && gpu_backend() === :cuda && @testset verbose = VERBOSE "CUDA" begin
     include("cuda/device.test.jl")            # ext/LuxTriangleAttentionCUDAExt.jl
+    include("cuda/flash_mma.test.jl")         # ext/LuxTriangleAttentionCUDAExt/flash_mma.jl
 end
 
 selected("ext_reactant"; backend=:reactant) && @testset verbose = VERBOSE "Reactant" begin

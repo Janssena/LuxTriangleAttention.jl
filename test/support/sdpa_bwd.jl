@@ -5,9 +5,11 @@
 
 import KernelDispatch
 
-function sdpa_bwd(q, k, v, mask, bias, o, lse, dO)
+# `kernel` defaults to the one `use_kernel!` selected. A switch only takes effect from the next top-level expression,
+# so code that picks the kernel and runs it in one function passes the kernel object instead.
+function sdpa_bwd(q, k, v, mask, bias, o, lse, dO; kernel=nothing)
     op = LuxTriangleAttention.SDPA()
-    g = KernelDispatch.backward(op, KernelDispatch.selected_kernel(op), (q, k, v, mask, bias),
-        (o, lse), (dO, nothing))
+    kernel = isnothing(kernel) ? KernelDispatch.selected_kernel(op) : kernel
+    g = KernelDispatch.backward(op, kernel, (q, k, v, mask, bias), (o, lse), (dO, nothing))
     return g[1], g[2], g[3], g[5]
 end

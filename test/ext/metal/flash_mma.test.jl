@@ -20,8 +20,8 @@ using KernelDispatch: OutArray, run_binary
         @inbounds ms[r+Int32(1), c+Int32(1)] = Float32(8 * r + c)
     end
     @synchronize
-    f = LuxTriangleAttention._mma_load(be, ms, 1, 1)
-    x, y = LuxTriangleAttention._mma_pair(be, f)
+    f = LuxTriangleAttention._mma_load_a(be, ms, 1, 1)
+    x, y = LuxTriangleAttention._mma_pair(be, f, 1)
     row, col = LuxTriangleAttention._mma_lane(be, l)
     unsafe_store!(pairs, x, 2l + Int32(1)); unsafe_store!(pairs, y, 2l + Int32(2))
     unsafe_store!(rc, Float32(row), 2l + Int32(1)); unsafe_store!(rc, Float32(col), 2l + Int32(2))
@@ -29,7 +29,7 @@ using KernelDispatch: OutArray, run_binary
     unsafe_store!(red, LuxTriangleAttention._mma_rowmax(be, max(x, y)), 2l + Int32(1))
     unsafe_store!(red, LuxTriangleAttention._mma_rowsum(be, x + y), 2l + Int32(2))
     # setpair round trip: the fragment stored back must hold the replaced entries.
-    g = LuxTriangleAttention._mma_setpair(be, f, -x, -y)
+    g = LuxTriangleAttention._mma_setpair(be, f, 1, -x, -y)
     @synchronize
     Metal.simdgroup_store(g, ms)
     @synchronize
