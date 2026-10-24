@@ -1,0 +1,13 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+KernelDispatch = "8d34074f-262e-46e2-9f95-b1abcc740b38"
+LiveServer = "16fef848-5104-11e9-1b77-fb7a48bbb589"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+LuxTriangleAttention = "3d5d7496-9328-4173-860c-6da38a33fff6"
+Static = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
+
+[sources]
+LuxTriangleAttention = {path = ".."}
+
+[compat]
+Documenter = "1"
