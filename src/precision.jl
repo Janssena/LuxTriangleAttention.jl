@@ -24,7 +24,9 @@ Whether `T` is a 16-bit floating-point type that needs the [`ContractionMode`](@
 ishalf(::Type) = false
 ishalf(::Type{Float16}) = true
 ishalf(::Type{BFloat16}) = true
-@static if isdefined(Core, :BFloat16)
+# BFloat16s.jl 0.6 on Julia 1.12 IS `Core.BFloat16`; a second method for the same type would overwrite the first
+# (an error during precompilation), so it is added only where the two types differ.
+@static if isdefined(Core, :BFloat16) && BFloat16 !== Core.BFloat16
     ishalf(::Type{Core.BFloat16}) = true
 end
 
