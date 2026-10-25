@@ -17,3 +17,19 @@
         @test relL2_mma(Array(a), r) < tol_bwd(T)
     end
 end
+
+# Gradients of a storage type the device computes at another type (CUDA: Float32 at Float16) come back in the
+# caller's types, `dbias` in the bias's, accurate to the narrower type.
+@testset "$T storage computed at $(LTA_.mma_compute_type(LTA_.mma_backend(), T))" for T in CAST_TYPES
+    Tc = LTA_.mma_compute_type(LTA_.mma_backend(), T)
+    shape = (32, 2, 37, 5, 2)
+    c = mma_case(T, shape, true, true)
+    o, lse = mma_forward(c, T, shape)
+    g = mma_backward(c, o, lse)
+    ref = mma_reference_grads(c)
+    @test all(x -> eltype(x) === T, g)
+    for (name, a, r) in zip((:dq, :dk, :dv, :dbias), g, ref)
+        @test all(isfinite, Array(a))
+        @test relL2_mma(Array(a), r) < tol_bwd(Tc) * 4
+    end
+end

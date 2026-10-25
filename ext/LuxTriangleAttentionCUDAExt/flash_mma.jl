@@ -36,6 +36,13 @@ LTA._mma_shape(::CUDABackendTag) = (16, 8, 16)
 LTA.mma_operand_types(::CUDABackendTag, ::Type{T}) where {T} =
     T <: F16OrBF16 && CUDACore.capability(CUDACore.device()) >= v"8.0" ? DataType[T] : DataType[]
 
+# The tensor cores take Float16 and BFloat16 storage as it is. Float32 storage runs at Float16 (its inputs saturating-cast,
+# its results cast back to Float32), for the accuracy of TF32 (also an 11-bit significand) at half the memory traffic of
+# Float32 storage; `:default` keeps Float32 exact. Anything else, or a GPU older than sm_80, has no matrix-unit path.
+LTA.mma_compute_type(::CUDABackendTag, ::Type{T}) where {T} =
+    CUDACore.capability(CUDACore.device()) < v"8.0" ? nothing :
+    T <: F16OrBF16 ? T : T === Float32 ? Float16 : nothing
+
 # The lane within its warp, 0-based (the groups are 1-D: `threads = (32·NSG, 1, 1)`).
 @inline _lane() = (CUDACore.threadIdx().x - Int32(1)) & Int32(31)
 

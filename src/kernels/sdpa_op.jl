@@ -210,6 +210,17 @@ function KernelDispatch.forward(op::SDPA, k::FlashScalar, q0, k0, v0, mask, bias
 end
 
 function KernelDispatch.forward(op::SDPA, k::FlashMMA, q0, k0, v0, mask, bias)
+    T = eltype(q0)
+    Tc = mma_compute_type(mma_backend(), T)
+    Tc === nothing && return _mma_fallback_forward(op, q0, k0, v0, mask, bias)
+    if Tc !== T
+        o, lse = _mma_forward(op, k, _narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask, _narrow(Tc, bias))
+        return _widen(T, o), lse
+    end
+    return _mma_forward(op, k, q0, k0, v0, mask, bias)
+end
+
+function _mma_forward(op, k, q0, k0, v0, mask, bias)
     q, kk, v, m, b, d = _sdpa_prep(q0, k0, v0, mask, bias, true)
     a = (; o=OutArray(d.T, _full(d)), lse=OutArray(Float32, _res(d)), q, k=kk, v, bias=b, mask=m)
     o, lse = call_binary(op, k, :fwd, stage_args(k, Val(:fwd), a, _scalars(d))...;
@@ -232,8 +243,20 @@ function KernelDispatch.backward(op::SDPA, k::FlashScalar, (q0, k0, v0, mask, bi
 end
 
 function KernelDispatch.backward(op::SDPA, k::FlashMMA, (q0, k0, v0, mask, bias), (o, lse), (dO, _))
+    T = eltype(q0)
+    Tc = mma_compute_type(mma_backend(), T)
+    isnothing(Tc) && return _mma_fallback_backward(op, (q0, k0, v0, mask, bias), (o, lse), (dO, nothing))
+    if Tc !== T
+        dq, dk, dv, _, db = _mma_backward(op, k, (_narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask,
+            _narrow(Tc, bias)), (_narrow(Tc, o), lse), (_narrow(Tc, dO), nothing))
+        return (_widen(T, dq), _widen(T, dk), _widen(T, dv), nothing, db === nothing ? nothing : _widen(eltype(bias), db))
+    end
+    return _mma_backward(op, k, (q0, k0, v0, mask, bias), (o, lse), (dO, nothing))
+end
+
+function _mma_backward(op, k, (q0, k0, v0, mask, bias), (o, lse), (dO, _))
     q, kk, v, m, b, d = _sdpa_prep(q0, k0, v0, mask, bias, true)
-    o, dO, lse = reshape(o, _full(d)), _store(d.T, reshape(dO, _full(d))), reshape(lse, _res(d))
+    o, dO, lse =reshape(o, _full(d)), _store(d.T, reshape(dO, _full(d))), reshape(lse, _res(d))
     s, key, extent = _scalars(d), _key(d), _extent(d)
     a = (; q, k=kk, v, bias=b, mask=m, dO, lse, delta=_delta(o, dO),
         dq=OutArray(d.T, _full(d)), dk=OutArray(d.T, _full(d)), dv=OutArray(d.T, _full(d)),
@@ -241,6 +264,30 @@ function KernelDispatch.backward(op::SDPA, k::FlashMMA, (q0, k0, v0, mask, bias)
     dk, dv, db = call_binary(op, k, :dkv, stage_args(k, Val(:dkv), a, s)...; key, extent)
     dq, = call_binary(op, k, :dq, stage_args(k, Val(:dq), a, s)...; key, extent)
     return (_as(dq, q0), _as(dk, k0), _as(dv, v0), nothing, d.hasbias ? _as(db, bias) : nothing)
+end
+
+# Where a device's matrix units do not take a storage type (CUDA: Float32, whose tensor-core operand would be TF32,
+# too coarse to use silently), `:flash_mma` computes the call at the type they do take (`mma_compute_type`):
+# the floating-point inputs are cast down, saturating, and the results cast back to the caller's types. Float32 data
+# on an NVIDIA GPU is therefore rounded to Float16 INSIDE this kernel (relative error ~1e-3, like Float16 storage),
+# accumulated in Float32 as always. `:default` is the kernel that keeps Float32 exact. A type with no such
+# fallback type (Float64, or a GPU without tensor cores) runs `:default` instead.
+#
+# SATURATING because a plain cast sends |x| > floatmax(Float16) = 65504 to ±Inf, and a Float32 bias carries
+# masking values like -1e9: saturated they still mean "masked" and stay finite, so a fully masked row stays uniform.
+_narrow(::Type, ::Nothing) = nothing
+_narrow(::Type{Tc}, x::AbstractArray) where {Tc} =
+    eltype(x) <: AbstractFloat && eltype(x) !== Tc ? Tc.(clamp.(x, -floatmax(Tc), floatmax(Tc))) : x
+_widen(::Type, ::Nothing) = nothing
+_widen(::Type{T}, x::AbstractArray) where {T} = eltype(x) === T ? x : T.(x)
+
+function _mma_fallback_forward(op, args...)
+    @info "`:flash_mma` cannot run this storage type on this device; running `:default`" maxlog = 1
+    return KernelDispatch.forward(op, FlashScalar(), args...)
+end
+function _mma_fallback_backward(op, args...)
+    @info "`:flash_mma` cannot run this storage type on this device; running `:default`" maxlog = 1
+    return KernelDispatch.backward(op, FlashScalar(), args...)
 end
 
 # --- this package's kernel-selection API ----------------------------------------------------------

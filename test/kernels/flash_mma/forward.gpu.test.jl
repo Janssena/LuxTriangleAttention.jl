@@ -25,7 +25,7 @@ end
 # direct call gave, bit for bit. (`:default` computes the same quantity to a different rounding, so a
 # selection that did nothing cannot pass.)
 @testset "selection routes to the kernel" begin
-    T, shape = Float32, (32, 2, 37, 5, 2)
+    T, shape = first(MMA_TYPES), (32, 2, 37, 5, 2)      # Float32 where the device runs it on its matrix units
     c = mma_case(T, shape, true, true)
     o, lse = mma_forward(c, T, shape)
     use_kernel!(:flash_mma)
@@ -67,4 +67,26 @@ end
         @test typeof(pctx) === typeof(ctx) && pctx == ctx
         @test pghost == (sizeof(typeof(ctx)) == 0)
     end
+end
+
+# A storage type the device's matrix units do not take runs at the type they do (CUDA: Float32 at Float16): the inputs
+# are rounded to it, the results come back in the caller's type. Accuracy is that of the narrower type, and the outputs are
+# finite even for logits and biases beyond its range (the cast saturates).
+@testset "$T storage computed at $(LTA_.mma_compute_type(LTA_.mma_backend(), T))" for T in CAST_TYPES
+    Tc = LTA_.mma_compute_type(LTA_.mma_backend(), T)
+    shape = (32, 2, 37, 5, 2)
+    c = mma_case(T, shape, true, true)
+    o, lse = mma_forward(c, T, shape)
+    @test eltype(o) === T                       # the caller's type, not the narrower one
+    @test eltype(lse) === Float32
+    f64(x) = x === nothing ? nothing : Float64.(x)
+    ref_o, ref_lse = reference_sdpa(f64(c.q), f64(c.k), f64(c.v), c.mask, f64(c.bias))
+    @test all(isfinite, Array(o))
+    @test relL2_mma(Array(o), ref_o) < tol_fwd(Tc) * 4      # inputs rounded to `Tc` as well as the output
+    fin = isfinite.(vec(ref_lse))
+    @test relL2_mma(vec(Array(lse))[fin], vec(ref_lse)[fin]) < tol_fwd(Tc) * 4
+    # A bias far beyond the narrower type's range (a mask written as -1e9) stays a mask, not a NaN.
+    big = merge(c, (; bias=fill(T(-1e9), size(c.bias)), mask=nothing))
+    ob, _ = mma_forward(big, T, shape)
+    @test all(isfinite, Array(ob))
 end

@@ -24,17 +24,24 @@ const LTAt = LuxTriangleAttention
         @test maximum(p.kt for p in LTAt.grid_points(KA, :fwd, 64, Float16, small)) >
               maximum(p.kt for p in LTAt.grid_points(KA, :fwd, 64, Float32, small))
         @test_throws ArgumentError LTAt.grid_points(KA, :nonsense, 32, Float32, caps)
-        for stage in LTAt.FLASH_MMA_STAGES
-            pts = LTAt.grid_points(MMA, stage, 32, Float32, caps)
-            @test !isempty(pts) && keys(first(pts)) == (:nsg, :r, :tile, :ops)
-            # The second products' operand type is tuned only for 16-bit storage.
-            @test unique(p.ops for p in pts) == [Float32]
-            for T in (Float16, LTAt.BFloat16)
-                @test Set(p.ops for p in LTAt.grid_points(MMA, stage, 32, T, caps)) == Set([Float32, T])
+        for stage in LTAt.FLASH_MMA_STAGES, T in (Float32, Float16, LTAt.BFloat16)
+            pts = LTAt.grid_points(MMA, stage, 32, T, caps)
+            # The second products' operand type comes from the loaded backend: by default Float32 and, for 16-bit
+            # storage, the storage type. A backend with none for a type (CUDA, Float32) has nothing to tune there.
+            ops = LTAt.mma_operand_types(LTAt.mma_backend(), T)
+            if isempty(ops)
+                @test isempty(pts)
+                continue
             end
+            @test keys(first(pts)) == (:nsg, :r, :tile, :ops)
+            @test Set(p.ops for p in pts) == Set(ops)
             @test all(p -> LTAt.mma_threads(p) <= caps.max_threads &&
-                LTAt.mma_shmem(stage, 32, Float32, p) <= caps.max_shmem, pts)
+                LTAt.mma_shmem(stage, 32, T, p) <= caps.max_shmem, pts)
         end
+        @test LTAt.mma_operand_types(KernelDispatch.CPUBackend(), Float32) == [Float32]       # the defaults
+        @test LTAt.mma_operand_types(KernelDispatch.CPUBackend(), Float16) == [Float32, Float16]
+        @test LTAt._mma_shape(KernelDispatch.CPUBackend()) == (8, 8, 8)
+        @test LTAt.mma_compute_type(KernelDispatch.CPUBackend(), Float32) === Float32     # a device runs T as it is by default
         # The device's thread cap filters before anything is compiled.
         tiny = LTAt.DeviceCaps(32, 128, 32768, "tiny")
         @test all(p -> LTAt.mma_threads(p) <= 128, LTAt.grid_points(MMA, :fwd, 32, Float32, tiny))

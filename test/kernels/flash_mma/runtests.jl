@@ -20,8 +20,17 @@ tol_fwd(T) = T === Float32 ? 1e-5 : T === Float16 ? 2e-3 : 1e-2
 tol_bwd(T) = T === Float32 ? 1e-5 : T === Float16 ? 1e-2 : 3e-2
 nanless(x) = map(y -> isnan(y) ? 0.0 : Float64(y), x)
 
+# The storage types the loaded device's matrix units take as they are. Others run at another type (CUDA: Float32 at Float16,
+# `CAST_TYPES`: rounded inputs, results cast back), tested on their own in `forward.gpu.test.jl` / `backward.gpu.test.jl`.
+const MMA_ALL_TYPES = (Float32, Float16, LuxTriangleAttention.BFloat16)
+const MMA_TYPES = filter(T -> LuxTriangleAttention.mma_compute_type(LuxTriangleAttention.mma_backend(), T) === T, MMA_ALL_TYPES)
+const CAST_TYPES = filter(MMA_ALL_TYPES) do T
+    Tc = LuxTriangleAttention.mma_compute_type(LuxTriangleAttention.mma_backend(), T)
+    Tc !== nothing && Tc !== T
+end
+
 const MMA_CASES = [(T, shape, hb, hm)
-    for T in (Float32, Float16, LuxTriangleAttention.BFloat16), shape in ((32, 2, 37, 5, 2), (16, 4, 24, 24, 1)),
+    for T in MMA_TYPES, shape in ((32, 2, 37, 5, 2), (16, 4, 24, 24, 1)),
         hb in (true, false), hm in (true, false)]
 
 # Operands of one case: `[hd, H, n, nouter, B]` q/k/v/dO, an optional bias and a KEEP mask with one
@@ -44,7 +53,8 @@ function mma_forward(c, T, shape)
     hd, _, n = shape
     tune_flash_mma!(n; dim=hd, T)
     op, kern = MMA()
-    @test haskey(KernelDispatch.variants(op, kern), LTA_._attention_variant_key(kern, T, hd, n;
+    Tc = LTA_.mma_compute_type(LTA_.mma_backend(), T)       # the type the call runs at (T, unless the device casts)
+    @test haskey(KernelDispatch.variants(op, kern), LTA_._attention_variant_key(kern, Tc, hd, n;
         hasbias=c.bias !== nothing, hasmask=c.mask !== nothing))
     return KernelDispatch.forward(op, kern, c.d(c.q), c.d(c.k), c.d(c.v), c.d(c.mask), c.d(c.bias))
 end

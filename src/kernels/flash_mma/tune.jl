@@ -65,6 +65,15 @@ configuration for `T` there (CUDA, Float32).
 """
 mma_operand_types(be, ::Type{T}) where {T} = T === Float32 ? DataType[Float32] : DataType[Float32, T]
 
+"""
+    mma_compute_type(be, T) -> Union{DataType,Nothing}
+
+The storage type `:flash_mma` computes a call of storage type `T` at on this device: `T` itself (the default, Metal), or the
+type its matrix units take instead, to which the call's inputs are cast (saturating) and from which the results are cast back
+(CUDA: Float32 runs at Float16); `nothing` when there is none, and the call runs `:default`. See `_narrow` in `sdpa_op.jl`.
+"""
+mma_compute_type(be, ::Type{T}) where {T} = T
+
 mma_rows(c) = first(mma_frag_shape()) * c.r * c.nsg
 mma_threads(c) = 32 * c.nsg
 
@@ -152,7 +161,9 @@ flash_mma_config(::Type{T}, dim::Integer, n::Integer) where {T} = tuned_config(F
 [`tune!`](@ref)`(FlashMMA(), lengths; dim, T, force)`: tune, compile and register the matrix-unit kernel
 `:$FLASH_MMA_NAME` at each length in `lengths`; select it with `use_kernel!(:$FLASH_MMA_NAME)`. A call of
 any length runs the closest tuned one; an eager call with none tunes [`tune_lengths`](@ref) lazily, a
-traced one refuses. `dim` must be a multiple of 8.
+traced one refuses. `dim` must be a multiple of the device's fragment contraction width (8 on Metal, 16 on NVIDIA).
+Where the device computes `T` at another type (Float32 at Float16 on CUDA, see `mma_compute_type`) that type is tuned; where
+it has none, a call runs `:default` and this returns without tuning.
 """
 function tune_flash_mma!(lengths=tune_lengths(); dim::Integer, T::Type=Float32, force::Bool=false)
     device_kernel_available() || throw(ErrorException(
@@ -160,5 +171,10 @@ function tune_flash_mma!(lengths=tune_lengths(); dim::Integer, T::Type=Float32, 
         "package for your GPU (e.g. `using Metal`) first."))
     dim % last(mma_frag_shape()) == 0 || throw(ArgumentError(
         "`:$FLASH_MMA_NAME` needs a head dimension that is a multiple of $(last(mma_frag_shape())) on this device; got $dim"))
-    return tune!(FlashMMA(), lengths; dim, T, force)
+    Tc = mma_compute_type(mma_backend(), T)       # the type a call of storage type `T` runs at
+    if Tc === nothing
+        @info "`:$FLASH_MMA_NAME` cannot run $T on this device; nothing to tune, `:default` runs for it" maxlog = 1
+        return KernelDispatch.variants(SDPA(), FlashMMA())
+    end
+    return tune!(FlashMMA(), lengths; dim, T=Tc, force)
 end
