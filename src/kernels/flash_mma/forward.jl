@@ -78,9 +78,6 @@ head dimension (`FK`) and the key / query tile (`FK`). Defaults to the 8×8×8 o
 """
 _mma_shape(::KernelBackend) = (8, 8, 8)
 
-# The same, from the tag's TYPE, for the `@generated` builders (they see types).
-_mma_dims(::Type{BE}) where {BE} = _mma_shape(BE())
-
 """
     _mma_load_a(be, a, r, c) -> fragment
     _mma_load_b(be, a, r, c) -> fragment
@@ -128,25 +125,25 @@ one slot (Metal).
 # ---------------------------------------------------------------------------------------------
 
 # `R` fragments × the `A` operands along the head dimension, loaded from a [rows, DIM] local array.
-@generated function _mma_rows(be, a, r0, ::Val{R}, ::Val{DIM}) where {R,DIM}
-    FM, FN, FK = _mma_dims(be)
+@generated function _mma_rows(be, a, r0, ::Val{SH}, ::Val{R}, ::Val{DIM}) where {SH,R,DIM}
+    FM, FN, FK = SH
     rows = (Expr(:tuple, (:(_mma_load_a(be, a, r0 + $(FM * (rb - 1) + 1), $(FK * (k - 1) + 1))) for k in 1:DIM÷FK)...)
             for rb in 1:R)
     return Expr(:block, Expr(:meta, :inline), Expr(:tuple, rows...))
 end
 
 # `R` fragments × the accumulators along the head dimension (`FN` channels each), zeroed.
-@generated function _mma_zeros(be, ::Val{R}, ::Val{DIM}) where {R,DIM}
-    FM, FN, FK = _mma_dims(be)
+@generated function _mma_zeros(be, ::Val{SH}, ::Val{R}, ::Val{DIM}) where {SH,R,DIM}
+    FM, FN, FK = SH
     rows = (Expr(:tuple, (:(_mma_zero(be, Float32)) for _ in 1:DIM÷FN)...) for _ in 1:R)
     return Expr(:block, Expr(:meta, :inline), Expr(:tuple, rows...))
 end
 
 # Store each lane's entries of `F[rb][d]` (times `w`) straight to device memory: the row is the lane's row of the
 # slot (`rows` + 8(u-1)), the channels `FN(d-1) + col` and the next.
-@generated function _mma_store_rows!(be, out, F, w, base, step, rows, n, col, ::Val{R}, ::Val{DIM},
-    ::Type{T}) where {R,DIM,T}
-    FM, FN, FK = _mma_dims(be)
+@generated function _mma_store_rows!(be, out, F, w, base, step, rows, n, col, ::Val{SH}, ::Val{R}, ::Val{DIM},
+    ::Type{T}) where {SH,R,DIM,T}
+    FM, FN, FK = SH
     NR = FM ÷ 8
     body = Expr[]
     for rb in 1:R, s in 1:NR
@@ -183,9 +180,9 @@ end
 # ---------------------------------------------------------------------------------------------
 
 # One key tile for the R query fragments of this simdgroup. `st[u] = (m, l)` of this lane's row slot `u`.
-@generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, ::Val{R},
-    ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {R,DIM,BK,HB}
-    FM, FN, FK = _mma_dims(be)
+@generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, ::Val{SH}, ::Val{R},
+    ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {SH,R,DIM,BK,HB}
+    FM, FN, FK = SH
     NR, NKD, NKB, NKK, NDN, NB = FM ÷ 8, DIM ÷ FK, BK ÷ FN, BK ÷ FK, DIM ÷ FN, FK ÷ FN
     body = Expr[]
     kf(kb, k) = Symbol(:kf_, kb, :_, k)
@@ -259,9 +256,9 @@ end
 @inline _mma_bias_rows(bh, n, j0, ::Val{U}) where {U} =
     ntuple(u -> (bh * n + min(j0 + Int32(8 * (u - 1)), n - Int32(1))) * n, Val(U))
 
-@generated function _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, lrow, col, ::Val{R},
-    ::Val{DIM}, ::Type{T}) where {R,DIM,T}
-    FM, FN, FK = _mma_dims(be)
+@generated function _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, lrow, col, ::Val{SH}, ::Val{R},
+    ::Val{DIM}, ::Type{T}) where {SH,R,DIM,T}
+    FM, FN, FK = SH
     NR = FM ÷ 8
     body = Expr[]
     for rb in 1:R, s in 1:NR
@@ -309,7 +306,8 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
     scale, n, nouter, nh, mheads, ::Val{BE}, ::Val{T}, ::Val{DIM}, ::Val{NSG},
     ::Val{R}, ::Val{BK}, ::Val{HB}, ::Val{HM}, ::Val{PE}) where {BE,T,DIM,NSG,R,BK,HB,HM,PE}
     be = BE()
-    FM, FN, FK = _mma_shape(be)
+    shp = _mma_shape(be)
+    FM, FN, FK = shp
     U = R * (FM ÷ 8)                       # row slots this lane holds
     BQ = FM * R * NSG
     qs = @localmem T (BQ, DIM)
@@ -346,8 +344,8 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
         e += NT
     end
     @synchronize
-    Qf = _mma_rows(be, qs, r0, Val(R), Val(DIM))
-    O = _mma_zeros(be, Val(R), Val(DIM))
+    Qf = _mma_rows(be, qs, r0, Val(shp), Val(R), Val(DIM))
+    O = _mma_zeros(be, Val(shp), Val(R), Val(DIM))
     st = ntuple(_ -> (_MMA_NEG, 0f0), Val(U))
     bbs = _mma_bias_rows(bh, n, j0, Val(U))
 
@@ -370,9 +368,9 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
             e += NT
         end
         @synchronize
-        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, Val(R), Val(DIM), Val(BK), Val(HB))
+        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, Val(shp), Val(R), Val(DIM), Val(BK), Val(HB))
         t += Int32(BK)
     end
     _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, (bi * nouter + i) * nh + hi, col,
-        Val(R), Val(DIM), T)
+        Val(shp), Val(R), Val(DIM), T)
 end

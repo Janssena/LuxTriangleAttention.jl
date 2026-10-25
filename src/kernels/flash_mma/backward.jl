@@ -5,8 +5,8 @@
 # One query tile for the R key fragments of this simdgroup. The scores are formed as `Sᵀ = K·Qᵀ` in blocks of `FN`
 # queries; `FK÷FN` blocks make one chunk, the contraction axis of `dV += Pᵀ·dO` and `dK += dSᵀ·Q`.
 @generated function _mma_kv_tile(be, dK, dV, Kf, Vf, qT, qN, dT, dN, ls, dl, bias, dbias, live,
-    keys, bh, n, t, col, ::Val{R}, ::Val{DIM}, ::Val{BQ}, ::Val{HB}) where {R,DIM,BQ,HB}
-    FM, FN, FK = _mma_dims(be)
+    keys, bh, n, t, col, ::Val{SH}, ::Val{R}, ::Val{DIM}, ::Val{BQ}, ::Val{HB}) where {SH,R,DIM,BQ,HB}
+    FM, FN, FK = SH
     NR, NKD, NQK, NDN, NB = FM ÷ 8, DIM ÷ FK, BQ ÷ FK, DIM ÷ FN, FK ÷ FN
     body = Expr[]
     dk = [Symbol(:dk_, r, :_, d) for r in 1:R, d in 1:NDN]
@@ -108,7 +108,8 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
     lse, delta, scale, n, nouter, nh, mheads, ::Val{BE}, ::Val{T}, ::Val{DIM}, ::Val{NSG},
     ::Val{R}, ::Val{BQ}, ::Val{HB}, ::Val{HM}, ::Val{PE}) where {BE,T,DIM,NSG,R,BQ,HB,HM,PE}
     be = BE()
-    FM, FN, FK = _mma_shape(be)
+    shp = _mma_shape(be)
+    FM, FN, FK = shp
     U = R * (FM ÷ 8)                       # row slots (keys) this lane holds
     BKV = FM * R * NSG
     qT = @localmem T (DIM, BQ)
@@ -195,7 +196,7 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
             e += NT
         end
         @synchronize
-        Kf = _mma_rows(be, kst, r0, Val(R), Val(DIM))
+        Kf = _mma_rows(be, kst, r0, Val(shp), Val(R), Val(DIM))
         @synchronize
         e = tid
         while e < Int32(BKV * DIM)
@@ -204,10 +205,10 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
             e += NT
         end
         @synchronize
-        Vf = _mma_rows(be, kst, r0, Val(R), Val(DIM))
+        Vf = _mma_rows(be, kst, r0, Val(shp), Val(R), Val(DIM))
         live = _mma_live(mask, (_sdiv(bh, mheads) * nouter + i) * n, keys, n, Val(U), Val(HM))
-        dK = _mma_zeros(be, Val(R), Val(DIM))
-        dV = _mma_zeros(be, Val(R), Val(DIM))
+        dK = _mma_zeros(be, Val(shp), Val(R), Val(DIM))
+        dV = _mma_zeros(be, Val(shp), Val(R), Val(DIM))
 
         t = Int32(0)
         while t < n
@@ -233,12 +234,12 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
             end
             @synchronize
             dK, dV = _mma_kv_tile(be, dK, dV, Kf, Vf, qT, qN, dT, dN, ls, dl, bias, dbias, live, keys,
-                bh, n, t, col, Val(R), Val(DIM), Val(BQ), Val(HB))
+                bh, n, t, col, Val(shp), Val(R), Val(DIM), Val(BQ), Val(HB))
             t += Int32(BQ)
         end
         # qN held q·scale·log2e, so dK = scale·Σ dS·q is the accumulator over log2e.
-        _mma_store_rows!(be, dk, dK, inv(_LOG2E), base, step, keys, n, col, Val(R), Val(DIM), T)
-        _mma_store_rows!(be, dv, dV, 1f0, base, step, keys, n, col, Val(R), Val(DIM), T)
+        _mma_store_rows!(be, dk, dK, inv(_LOG2E), base, step, keys, n, col, Val(shp), Val(R), Val(DIM), T)
+        _mma_store_rows!(be, dv, dV, 1f0, base, step, keys, n, col, Val(shp), Val(R), Val(DIM), T)
     end
 end
 
@@ -248,9 +249,9 @@ end
 
 # One key tile for the R query fragments of this simdgroup: `S = Q·Kᵀ` and `dP = dO·Vᵀ` in blocks of `FN` keys,
 # `dQ += dS·K` over chunks of `FK` keys.
-@generated function _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, t, n, col, ::Val{R},
-    ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {R,DIM,BK,HB}
-    FM, FN, FK = _mma_dims(be)
+@generated function _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, t, n, col, ::Val{SH}, ::Val{R},
+    ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {SH,R,DIM,BK,HB}
+    FM, FN, FK = SH
     NR, NKD, NKK, NDN, NB = FM ÷ 8, DIM ÷ FK, BK ÷ FK, DIM ÷ FN, FK ÷ FN
     body = Expr[]
     dq = [Symbol(:dq_, r, :_, d) for r in 1:R, d in 1:NDN]
@@ -325,7 +326,8 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
     scale, n, nouter, nh, mheads, ::Val{BE}, ::Val{T}, ::Val{DIM}, ::Val{NSG},
     ::Val{R}, ::Val{BK}, ::Val{HB}, ::Val{HM}, ::Val{PE}) where {BE,T,DIM,NSG,R,BK,HB,HM,PE}
     be = BE()
-    FM, FN, FK = _mma_shape(be)
+    shp = _mma_shape(be)
+    FM, FN, FK = shp
     U = R * (FM ÷ 8)                       # row slots (queries) this lane holds
     BQ = FM * R * NSG
     qs = @localmem T (BQ, DIM)
@@ -364,7 +366,7 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
         e += NT
     end
     @synchronize
-    Qf = _mma_rows(be, qs, r0, Val(R), Val(DIM))
+    Qf = _mma_rows(be, qs, r0, Val(shp), Val(R), Val(DIM))
     @synchronize
     e = tid
     while e < Int32(BQ * DIM)
@@ -373,8 +375,8 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
         e += NT
     end
     @synchronize
-    Df = _mma_rows(be, qs, r0, Val(R), Val(DIM))
-    dQ = _mma_zeros(be, Val(R), Val(DIM))
+    Df = _mma_rows(be, qs, r0, Val(shp), Val(R), Val(DIM))
+    dQ = _mma_zeros(be, Val(shp), Val(R), Val(DIM))
     rs = _mma_row_stats(lse, delta, lrow, j0, n, Val(U))
     bbs = _mma_bias_rows(bh, n, j0, Val(U))
 
@@ -399,9 +401,9 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
             e += NT
         end
         @synchronize
-        dQ = _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, t, n, col, Val(R),
+        dQ = _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, t, n, col, Val(shp), Val(R),
             Val(DIM), Val(BK), Val(HB))
         t += Int32(BK)
     end
-    _mma_store_rows!(be, dq, dQ, scale, base, step, j0, n, col, Val(R), Val(DIM), T)
+    _mma_store_rows!(be, dq, dQ, scale, base, step, j0, n, col, Val(shp), Val(R), Val(DIM), T)
 end
