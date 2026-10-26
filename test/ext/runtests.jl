@@ -6,6 +6,18 @@
 #
 # `device_call` was removed from KernelDispatch.jl (see `metal/flash_mma.test.jl` for the `ka_compile` replacement).
 
+# XLA multiplies Float32 matrices at TF32 precision on NVIDIA GPUs from Ampere on (its default `dot_general` precision): a
+# relative error of ~3e-4 against Float32 (measured on an A40, test/scratch/cuda_traced_spike.jl), which the Float32 tolerances of
+# the traced tests do not allow and which says nothing about this package. The Reactant units therefore run at HIGHEST precision
+# on CUDA, so what they measure is our code. (Metal and the CPU client multiply in full Float32 already.)
+function reactant_exact(f)
+    (isdefined(Main, :GPU) && gpu_backend() === :cuda) || return f()
+    return Base.invokelatest() do
+        R = Main.Reactant
+        R.with_config(f; dot_general_precision=R.PrecisionConfig.HIGHEST, convolution_precision=R.PrecisionConfig.HIGHEST)
+    end
+end
+
 selected("ext_metal"; backend=:gpu) && gpu_backend() === :metal && @testset verbose = VERBOSE "Metal" begin
     include("metal/flash_mma.test.jl")        # ext/LuxTriangleAttentionMetalExt/flash_mma.jl
     include("metal/tune.test.jl")             # what the Apple compiler does with the tuned kernels
@@ -17,16 +29,20 @@ selected("ext_cuda"; backend=:gpu) && gpu_backend() === :cuda && @testset verbos
 end
 
 selected("ext_reactant"; backend=:reactant) && @testset verbose = VERBOSE "Reactant" begin
-    @testset "SDPA paths" begin include("reactant/sdpa_op.test.jl") end                  # against the native paths
-    @testset "chunked attention" begin include("reactant/chunk.test.jl") end             # ext/LuxTriangleAttentionReactantExt/chunk.jl
-    @testset "Attention, 16-bit" begin include("reactant/attention.test.jl") end
-    @testset "TriangleAttention, 16-bit" begin include("reactant/triangle_attention.test.jl") end
-    @testset "StableLayerNorm" begin include("reactant/primitives.test.jl") end
-    @testset "TriMulCore" begin include("reactant/tri_mul_core.test.jl") end             # Folded and HalfSafe
+    reactant_exact() do
+        @testset "SDPA paths" begin include("reactant/sdpa_op.test.jl") end                  # against the native paths
+        @testset "chunked attention" begin include("reactant/chunk.test.jl") end             # ext/LuxTriangleAttentionReactantExt/chunk.jl
+        @testset "Attention, 16-bit" begin include("reactant/attention.test.jl") end
+        @testset "TriangleAttention, 16-bit" begin include("reactant/triangle_attention.test.jl") end
+        @testset "StableLayerNorm" begin include("reactant/primitives.test.jl") end
+        @testset "TriMulCore" begin include("reactant/tri_mul_core.test.jl") end             # Folded and HalfSafe
+    end
 end
 
 selected_traced_on_gpu("kernel") && @testset verbose = VERBOSE "Reactant, kernels in the trace" begin
-    @testset "SDPA kernel launches" begin include("reactant/kernel_launch.test.jl") end
-    @testset "Attention(use_kernel=true)" begin include("reactant/attention_kernel.test.jl") end
-    @testset ":flash_mma" begin include("reactant/flash_mma.test.jl") end
+    reactant_exact() do
+        @testset "SDPA kernel launches" begin include("reactant/kernel_launch.test.jl") end
+        @testset "Attention(use_kernel=true)" begin include("reactant/attention_kernel.test.jl") end
+        @testset ":flash_mma" begin include("reactant/flash_mma.test.jl") end
+    end
 end
