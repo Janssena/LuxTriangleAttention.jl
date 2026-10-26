@@ -1,6 +1,6 @@
 # The SAME backward as `test/kernels/flash/backward.gpu.test.jl`, reached the OTHER way: as the reverse
 # rule on a `stablehlo.custom_call`, via the Reactant extension's traced registry-entry launcher
-# (`launch_forward!` / `traced_reverse` in KernelDispatch' `ext/KernelDispatchReactantExt.jl`). It runs only with a GPU, traced to its client (jax-mps for Metal). What is under test here is the
+# (`launch_forward!` / `traced_reverse` in KernelDispatch' `ext/KernelDispatchReactantExt.jl`). It runs only with a GPU, traced to its client (`traced_client()`: jax-mps for Metal, XLA's own for CUDA). What is under test here is the
 # EXTENSION's own machinery — the LTA-layout <-> kernel-layout reversals, the operand ORDER in the
 # buffer table, the `(output, lse)` results being fed back in as the reverse's own operands, and the
 # `enzyme.reverse` attribute actually landing on the call — not the kernel math itself, which the
@@ -19,8 +19,8 @@ using Test, Random, Reactant
 
 const _MPS = traced_client()
 
-if _MPS === nothing
-    @warn "jax-mps Metal PJRT plugin not found; skipping traced device-kernel tests" maxlog = 1
+if isnothing(_MPS)
+    @warn "no Reactant client for the GPU found; skipping traced device-kernel tests" maxlog = 1
 else
     # The default client is process-global, and every later test file traces against whatever it is
     # left as, so it is restored below rather than left pointing at Metal.
@@ -169,8 +169,10 @@ else
             end
             ir = repr(Reactant.@code_hlo optimize = false donated_args = :none bwd(
                 qd, kd, vd, maskd, biasd))
-            @test length(collect(eachmatch(r"mps\.metal_kernel_lib", ir))) == 4   # fwd + dq, dk, dv
-            @test occursin("zero_init", ir)
+            @test length(collect(eachmatch(Regex(TRACED_CALL_TARGET), ir))) == 4   # fwd + dq, dk, dv
+            # The flag is how jax-mps (Metal) is told to zero a result; XLA's kernel-call handler on CUDA instead gets every
+            # output as a zero-filled operand aliased to its result, so the numbers above are what pin dbias there.
+            GPU === :metal && @test occursin("zero_init", ir)
         end
     end
 

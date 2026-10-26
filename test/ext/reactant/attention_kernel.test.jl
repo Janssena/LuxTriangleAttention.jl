@@ -1,5 +1,5 @@
 # The ordinary `Attention` layer on the fused kernel (`use_kernel=true`), against the SAME layer and
-# parameters on the plain softmax path (`use_kernel=false`), both traced on the jax-mps Metal client, and the traced
+# parameters on the plain softmax path (`use_kernel=false`), both traced on the GPU's Reactant client (`traced_client()`: jax-mps for Metal, XLA's own for CUDA), and the traced
 # kernel against the same kernel launched eagerly on device arrays (`attention.gpu.test.jl` is the eager kernel against
 # no kernel).
 #
@@ -30,10 +30,10 @@ function _holes(dims...)
     return m
 end
 
-if _MPS_ATT === nothing
-    @warn "jax-mps Metal PJRT plugin not found; skipping Attention-on-kernel tests" maxlog = 1
-elseif GPU === nothing
-    @warn "Metal not functional; skipping Attention-on-kernel tests" maxlog = 1
+if isnothing(_MPS_ATT)
+    @warn "no Reactant client for the GPU found; skipping Attention-on-kernel tests" maxlog = 1
+elseif isnothing(GPU)
+    @warn "no functional GPU backend; skipping Attention-on-kernel tests" maxlog = 1
 else
     const _PREV_BACKEND_ATT = Reactant.XLA.default_backend()
     Reactant.set_default_backend(_MPS_ATT)

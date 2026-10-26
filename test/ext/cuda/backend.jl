@@ -16,3 +16,8 @@ backend_tag() = KernelDispatch.CUDABackendTag()
 
 # Reactant's own CUDA client; KernelDispatch's tests name it the same way.
 traced_client() = "gpu"
+
+# What a traced launch's custom call is named in the emitted MLIR (XLA's kernel-call handler; see KernelDispatch's
+# `ext/KernelDispatchReactantExt/cuda.jl`). The traced tests assert it is there: a quiet fallback to the host path would
+# pass every numerical comparison while testing nothing.
+const TRACED_CALL_TARGET = "triton_kernel_call_ffi"

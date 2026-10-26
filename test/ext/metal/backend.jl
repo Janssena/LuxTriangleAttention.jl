@@ -22,3 +22,7 @@ function traced_client()
     isdefined(Main, :mps_client) || include(joinpath(@__DIR__, "..", "..", "mps_client.jl"))
     return Base.invokelatest(Main.mps_client)
 end
+
+# What a traced launch's custom call is named in the emitted MLIR (the traced tests assert it is there: a quiet fallback to
+# the host path would pass every numerical comparison while testing nothing).
+const TRACED_CALL_TARGET = "mps.metal_kernel_lib"
