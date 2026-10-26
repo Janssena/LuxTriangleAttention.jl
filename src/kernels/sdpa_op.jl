@@ -181,11 +181,15 @@ function KernelDispatch.nearest(::SDPA, ::BuiltinKernel, keys, key)
     return argmin(k -> (abs(k[3] - key[3]), -k[3]), cands)
 end
 
+# The storage type a variant key names (`nameof(T)`): BFloat16 is BFloat16s.jl's (`Core.BFloat16` from Julia 1.12), which `Base`
+# does not export on every Julia version.
+_storage_type(name::Symbol) = name === :BFloat16 ? BFloat16 : getfield(Base, name)
+
 # No variant at all for this dtype, head dim and bias/mask presence: tune the default lengths now
 # (`tune_lengths`) — the kernels are ours, and a fresh install should just work. Never mid-trace:
 # tuning is eager device work the tracer would capture.
 function KernelDispatch.build!(::SDPA, k::BuiltinKernel, key)
-    T, dim, n = getfield(Base, key[1]), key[2], key[3]
+    T, dim, n = _storage_type(key[1]), key[2], key[3]
     name, ls = KernelDispatch.kernelname(k), tune_lengths()
     tune = (k isa FlashScalar ? "tune_flash_kernel!" : "tune_flash_mma!") * "($ls; dim=$dim, T=$T)"
     KernelDispatch.tracing() && throw(ErrorException(
