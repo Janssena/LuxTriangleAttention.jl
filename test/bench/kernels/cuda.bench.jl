@@ -57,8 +57,8 @@ for T in TYPES, hd in HEADDIMS, n in LENGTHS
         "runs :default"
     end
     @printf("%-9s %4d %4d | %9.3f  %9.3f  %6.2fx | %9.3f  %9.3f  %6.2fx | %s\n", nameof(T), hd, n,
-        row.default[1], row.mma[1], row.default[1] / row.mma[1],
-        row.default[2], row.mma[2], row.default[2] / row.mma[2], cfg)
+        row[:default][1], row[:mma][1], row[:default][1] / row[:mma][1],
+        row[:default][2], row[:mma][2], row[:default][2] / row[:mma][2], cfg)
 end
 
 # --- head dimension 8 (the AlphaFold size): would padding it to 16 pay off? -------------------------------------------------
