@@ -1,9 +1,13 @@
 # The sweeps behind the Python parity files, `test/layers/<layer>.<model>.test.jl`.
 #
-# A parity file says what is specific to one reference (the Python class, how its weights are copied, how it is
-# called); the sweep says what is compared: the Julia layer against the Python one for every precision, every
+# A parity file says what is specific to the Julia side of one reference (its bias terms, the width of its hidden
+# layer); the sweep says what is compared: the Julia layer against the Python one for every precision, every
 # case of the reference, and every configuration of the Julia layer that must not change the result (the parameter
 # layout, chunking). Python runs once per (precision, case, parameter layout) and is the ground truth.
+#
+# Python is not run by the tests: its outputs are recorded in `test/fixtures/python/<component>.<model>.safetensors`
+# (support/fixtures.jl) and the sweeps read them back. What is specific to the Python side (the class, how the weights
+# are copied in, how it is called) is in `test/python/references.jl`, loaded only to record the outputs again.
 #
 # Only the native layer on the host is swept. Other backends are not: Julia's own array code is trusted there, and
 # tracing the same layer in another precision is Reactant's to get right. What is ours is tested against the native layer
@@ -27,11 +31,13 @@ parity_selected(component, model) = selected(component; model)
 mask, every precision, `fuse_qkv` (the parameter layout; the weights are copied into Python from whichever the layer
 has) and `chunk_size` (whole, or in slices of `chunk` along the batch axis).
 
-`make_py(chn, head_dim, num_heads)` builds the Python layer; `call_py(py_layer, x_py, mask, mask_additive_py, bias_py, T)`
-calls it, since the references take their mask and bias differently.
+The Python side is `make_py(chn, head_dim, num_heads)`, which builds the Python layer, and
+`call_py(py_layer, x_py, mask, mask_additive_py, bias_py, T)`, which calls it, since the references take their mask and
+bias differently (`test/python/references.jl`).
 """
-function attention_parity(model::AbstractString; use_bias, make_py, call_py)
+function attention_parity(model::AbstractString; use_bias)
     parity_selected("attention", model) || return
+    refs = References("attention", model)
     rng = Random.Xoshiro(42)
     N, S, B = 16, 8, 2
     chn_in, num_heads, head_dim = 32, 6, 8
@@ -53,24 +59,27 @@ function attention_parity(model::AbstractString; use_bias, make_py, call_py)
                             bias = randn(rng, T, num_heads, N, N, B)
                             # The symmetric input is attended over its other token axis (see `Attention`).
                             x_jl = dim_name == "4D inputs (symmetric)" ? permutedims(x, (1, 3, 2, 4)) : x
-                            bias_prep = prep_bias(bias, x, static(bias_layout))
-                            x_py = if dim_name == "4D inputs (non-symmetric)"
-                                to_py(permutedims(x, reverse(1:4)); swap_batch_dim=false)   # Python takes B, S, N, C
-                            else
-                                to_py(x; swap_batch_dim=true)
-                            end
-                            mask_prep = prep_mask(mask)
-                            mask_py = permutedims(mask_prep, reverse(1:ndims(mask_prep)))
-                            mask_add_py = to_py(inf_val .* (mask_py .- one(T)); swap_batch_dim=false).to(py_dtype(T))
-                            bias_py = to_py(permutedims(bias_prep, reverse(1:ndims(bias_prep))); swap_batch_dim=false)
 
                             for fuse_qkv in (true, false)
                                 layer0 = Attention(chn_in, head_dim, num_heads; use_bias, bias_layout, fuse_qkv)
-                                ps, st = Lux.setup(rng, layer0) |> convert_types(T)
-                                py_layer = make_py(chn_in, head_dim, num_heads)
-                                sync_attention!(py_layer, ps)
-                                y_py = call_py(py_layer, x_py, mask, mask_add_py, bias_py, T)
-                                y_ref = permutedims(to_jl(y_py; swap_batch_dim=false), reverse(1:ndims(x_jl)))
+                                ps0, st0 = Lux.setup(rng, layer0)
+                                ps, st = (weights(refs, "$dim_name/fuse_qkv=$fuse_qkv", ps0), st0) |> convert_types(T)
+                                y_ref = reference(refs, "$dim_name/$mname/$T/fuse_qkv=$fuse_qkv", fingerprint(x, bias, mask)) do py
+                                    bias_prep = prep_bias(bias, x, static(bias_layout))
+                                    x_py = if dim_name == "4D inputs (non-symmetric)"
+                                        to_py(permutedims(x, reverse(1:4)); swap_batch_dim=false)   # Python takes B, S, N, C
+                                    else
+                                        to_py(x; swap_batch_dim=true)
+                                    end
+                                    mask_prep = prep_mask(mask)
+                                    mask_py = permutedims(mask_prep, reverse(1:ndims(mask_prep)))
+                                    mask_add_py = to_py(inf_val .* (mask_py .- one(T)); swap_batch_dim=false).to(py_dtype(T))
+                                    bias_py = to_py(permutedims(bias_prep, reverse(1:ndims(bias_prep))); swap_batch_dim=false)
+                                    py_layer = py.make_py(chn_in, head_dim, num_heads)
+                                    sync_attention!(py_layer, ps)
+                                    y_py = py.call_py(py_layer, x_py, mask, mask_add_py, bias_py, T)
+                                    permutedims(to_jl(y_py; swap_batch_dim=false), reverse(1:ndims(x_jl)))
+                                end
 
                                 for chunk_size in (nothing, chunk)
                                     layer = Attention(chn_in, head_dim, num_heads; use_bias, bias_layout, fuse_qkv, chunk_size)
@@ -88,6 +97,7 @@ function attention_parity(model::AbstractString; use_bias, make_py, call_py)
             end
         end
     end
+    save(refs)
     return nothing
 end
 
@@ -99,11 +109,12 @@ end
 `TriangleAttention` against one Python reference, for both directions, with and without a mask, every precision,
 `fuse_qkv` and `chunk_size`.
 
-`make_py(chn_in, chn_hidden, num_heads, is_starting, inf)` builds the Python layer and `sync_py(py_layer, ps)`
-copies the parameters into it.
+The Python side is `make_py(chn_in, chn_hidden, num_heads, is_starting, inf)`, which builds the Python layer, and
+`sync_py(py_layer, ps)`, which copies the parameters into it (`test/python/references.jl`).
 """
-function triangle_attention_parity(model::AbstractString; use_bias, make_py, sync_py)
+function triangle_attention_parity(model::AbstractString; use_bias)
     parity_selected("triangle_attention", model) || return
+    refs = References("triangle_attention", model)
     rng = Random.Xoshiro(42)
     chn_in, N, B = 64, 8, 2
     chn_hidden, num_heads = 32, 4                     # chn_hidden is the head dimension
@@ -111,16 +122,20 @@ function triangle_attention_parity(model::AbstractString; use_bias, make_py, syn
         for T in PARITY_TYPES
             inf_val = T == Float16 ? Float16(1e4) : T(1e9)
             x = randn(rng, T, chn_in, N, N, B)
-            x_py = to_py(x; swap_batch_dim=true)
             for (mname, mask) in (("No mask", nothing), ("Random mask", rand(rng, Bool, N, N, B)))
-                mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T))   # Python wants floats
                 @testset verbose = VERBOSE "TriangleAttention ($mname)" begin
                     for is_starting in (true, false), fuse_qkv in (true, false)
                         layer0 = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias, fuse_qkv)
-                        ps, st = Lux.setup(rng, layer0) |> convert_types(T)
-                        py_layer = make_py(chn_in, chn_hidden, num_heads, is_starting, inf_val)
-                        sync_py(py_layer, ps)
-                        y_ref = to_jl(py_layer(x_py, mask_py); swap_batch_dim=true)
+                        ps0, st0 = Lux.setup(rng, layer0)
+                        ps, st = (weights(refs, "$(is_starting ? "starting" : "ending")/fuse_qkv=$fuse_qkv", ps0), st0) |> convert_types(T)
+                        key = "$mname/$T/$(is_starting ? "starting" : "ending")/fuse_qkv=$fuse_qkv"
+                        y_ref = reference(refs, key, fingerprint(x, mask)) do py
+                            x_py = to_py(x; swap_batch_dim=true)
+                            mask_py = isnothing(mask) ? nothing : to_py(permutedims(mask, (3, 1, 2))).to(py_dtype(T))   # Python wants floats
+                            py_layer = py.make_py(chn_in, chn_hidden, num_heads, is_starting, inf_val)
+                            py.sync_py(py_layer, ps)
+                            to_jl(py_layer(x_py, mask_py); swap_batch_dim=true)
+                        end
 
                         for chunk_size in (nothing, 3)
                             layer = TriangleAttention(chn_in, chn_hidden, num_heads; is_starting, use_bias, fuse_qkv, chunk_size)
@@ -136,44 +151,11 @@ function triangle_attention_parity(model::AbstractString; use_bias, make_py, syn
             end
         end
     end
+    save(refs)
     return nothing
 end
 
 # ── TriangleMultiplication ────────────────────────────────────────────────────────────────────────
-
-# The a and b projections of a `TriMulCore`'s parameters as two unfused GLUs each, whichever way the layer holds them
-# (`fused`: one GLU for both, a in the first `H` rows; `fused_glu`: values and gates in one Dense).
-function trimul_ab(core::NamedTuple)
-    if isempty(core.glu_ab)
-        return _unfuse(core.glu_a), _unfuse(core.glu_b)
-    end
-    u = _unfuse(core.glu_ab)
-    H = size(u.linear.weight, 1) ÷ 2
-    rows(r) = (linear=map(p -> selectdim(p, 1, r), u.linear), gate=map(p -> selectdim(p, 1, r), u.gate))
-    return rows(1:H), rows(H+1:2H)
-end
-
-"""
-    sync_trimul!(py, ps; norm_in, norm_out, out, a=nothing, b=nothing, ab=nothing)
-
-Copy a `TriangleMultiplication`'s parameters, in whichever of its four layouts, into a Python layer. The names are
-the Python layer's attributes: for the layer norms, `out` for the output GLU as `(linear, gate)`, and either `a` and `b`
-or, when Python holds both projections in one Dense with `a` first, `ab`.
-"""
-function sync_trimul!(py, ps::NamedTuple; norm_in, norm_out, out, a=nothing, b=nothing, ab=nothing)
-    sync_layernorm!(py[norm_in], ps.layer_norm)
-    ua, ub = trimul_ab(ps.core)
-    if ab === nothing
-        sync_glu!(py, ua; ref=a)
-        sync_glu!(py, ub; ref=b)
-    else
-        both(x, y) = map((p, q) -> cat(p, q; dims=1), x, y)
-        sync_glu!(py, (linear=both(ua.linear, ub.linear), gate=both(ua.gate, ub.gate)); ref=ab)
-    end
-    sync_layernorm!(py[norm_out], ps.core.layer_norm_out)
-    sync_glu!(py, ps.core.glu_out; ref=out)
-    return nothing
-end
 
 """
     trimul_parity(model; use_bias, chn_hidden, make_py, sync_py, mask_py, upcasts=false)
@@ -182,13 +164,15 @@ end
 precision and all four parameter layouts (`fused` × `fused_glu`). In Float16 the layer is also run `Folded`: the
 parameters prepared by `fold_trimul`, which changes how the contraction is carried out and not the result.
 
-`make_py(is_outgoing, chn_in, chn_hidden)` builds the Python layer, `sync_py(py_layer, ps)` copies the parameters into
-it and `mask_py(mask, T, N, B)` gives the mask in the form it takes. A reference that upcasts to Float32 inside
+The Python side is `make_py(is_outgoing, chn_in, chn_hidden)`, which builds the Python layer, `sync_py(py_layer, ps)`,
+which copies the parameters into it, and `mask_py(mask, T, N, B)`, which gives the mask in the form it takes
+(`test/python/references.jl`). A reference that upcasts to Float32 inside
 (`upcasts=true`) cannot be run in Float64 either, since PyTorch refuses its mixed dtypes; it runs in Float32 there, and the
 Float64 layer is compared with it to Float32's tolerance.
 """
-function trimul_parity(model::AbstractString; use_bias, chn_hidden, make_py, sync_py, mask_py, upcasts=false)
+function trimul_parity(model::AbstractString; use_bias, chn_hidden, upcasts=false)
     parity_selected("triangle_multiplication", model) || return
+    refs = References("triangle_multiplication", model)
     rng = Random.Xoshiro(42)
     chn_in, N, B = 64, 16, 2
     @testset verbose = VERBOSE "$model" begin
@@ -199,17 +183,20 @@ function trimul_parity(model::AbstractString; use_bias, chn_hidden, make_py, syn
             # Float16-rounded numbers, and the Julia layer is compared with that.
             Tpy = T === Float16 || (upcasts && T === Float64) ? Float32 : T
             rtol = Tpy === T ? parity_rtol(T) : max(parity_rtol(T), parity_rtol(Float32))
-            x_py = to_py(Tpy.(x); swap_batch_dim=true)
             for (mname, mask) in (("No mask", nothing), ("Random mask", rand(rng, Bool, N, N, B)))
-                mask_p = mask_py(mask, Tpy, N, B)
                 @testset verbose = VERBOSE "TriangleMultiplication ($mname)" begin
                     for is_outgoing in (true, false), (fused, fused_glu) in ((true, true), (true, false), (false, true), (false, false))
                         layer = TriangleMultiplication(chn_in, chn_hidden; is_outgoing, use_bias, fused, fused_glu)
                         ps32, st32 = Lux.setup(rng, layer)
+                        ps32 = weights(refs, "$(is_outgoing ? "outgoing" : "incoming")/fused=$fused/fused_glu=$fused_glu", ps32)
                         ps, st = (ps32, st32) |> convert_types(T)
-                        py_layer = make_py(is_outgoing, chn_in, chn_hidden)
-                        sync_py(py_layer, Tpy === T ? ps : Lux.f32(ps))
-                        y_ref = to_jl(py_layer(x_py, mask_p); swap_batch_dim=true)
+                        key = "$mname/$T/$(is_outgoing ? "outgoing" : "incoming")/fused=$fused/fused_glu=$fused_glu"
+                        y_ref = reference(refs, key, fingerprint(x, mask)) do py
+                            x_py = to_py(Tpy.(x); swap_batch_dim=true)
+                            py_layer = py.make_py(is_outgoing, chn_in, chn_hidden)
+                            py.sync_py(py_layer, Tpy === T ? ps : Lux.f32(ps))
+                            to_jl(py_layer(x_py, py.mask_py(mask, Tpy, N, B)); swap_batch_dim=true)
+                        end
 
                         # (name, k): Float16 data takes the contraction in Float32 by default; folding scales the weights
                         # by 2⁻ᵏ in Float32 before they are cast, and the layer undoes it.
@@ -228,5 +215,6 @@ function trimul_parity(model::AbstractString; use_bias, chn_hidden, make_py, syn
             end
         end
     end
+    save(refs)
     return nothing
 end

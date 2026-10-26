@@ -1,0 +1,4 @@
+# The environment of the Python references, stacked on the test one only when recording them (test/python/README.md).
+# It holds PyCall alone, so that a test run neither installs nor builds it.
+[deps]
+PyCall = "438e738f-606a-5dbb-bf0a-cddfbfd45ab0"

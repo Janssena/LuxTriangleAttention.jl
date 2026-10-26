@@ -1,7 +1,7 @@
 name: CPU tests
 
 # The `cpu` backend of test/runtests.jl: needs no GPU (the Reactant tests run on its CPU client, the Python parity
-# sweeps are not selected, as no model is named). The `gpu` tests need an NVIDIA or Apple GPU and are run by hand.
+# sweeps read their recorded references, the lazy `python_fixtures` artifact, and run no Python). The `gpu` tests need an NVIDIA or Apple GPU and are run by hand.
 
 on:
   push:

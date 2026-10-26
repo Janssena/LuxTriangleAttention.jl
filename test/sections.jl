@@ -8,8 +8,8 @@
 #              `support/backend_gpu.jl`: eager device arrays and the GPU's traced client) or `reactant` (traced on
 #              Reactant's default client). The files that need a GPU are named `<file>.gpu.test.jl`; what is specific to one
 #              backend is in `test/ext/<backend>/`, which runs when that backend is the one found (`ext_metal`).
-#   model      `af2`, `af3`, `boltz2`: the Python reference a parity unit compares with (on the host). Naming one of
-#              these is also what loads PyCall + torch.
+#   model      `af2`, `af3`, `boltz2`: the Python reference a parity unit compares with (on the host); it is read from
+#              the outputs recorded in test/fixtures/python/, Python is not run (support/fixtures.jl).
 #
 # A token on the command line filters its axis; no token on an axis leaves it unfiltered. Tokens of one axis
 # are OR-ed, the axes are AND-ed: `attention af3 cpu` is the AF3 attention parity on the host. When a model

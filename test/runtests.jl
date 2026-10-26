@@ -10,8 +10,8 @@
 #
 # The tokens, what each axis means and how they combine are in `test/sections.jl`. In short: `component` is the
 # src/ (or ext/) file under test, `backend` what it needs to run (a backend that is not available is skipped with
-# a warning), `model` the Python reference of a parity unit; naming a model is the only thing that loads PyCall
-# and torch. `JULIA_TEST_VERBOSE=true` prints the counts of the nested testsets too, also when they pass (Julia's
+# a warning), `model` the Python reference of a parity unit (its recorded outputs are read, Python is not run).
+# `JULIA_TEST_VERBOSE=true` prints the counts of the nested testsets too, also when they pass (Julia's
 # Test hides them; the variable is read in sections.jl, not by Julia).
 
 import LuxTriangleAttention: Lux, Static.static
@@ -23,11 +23,14 @@ include("sections.jl")
 include("support/backends.jl")
 include("support/backend_gpu.jl")
 
-# The Python reference is heavy (`Pkg.build("PyCall")`, importing torch), so only a run that has a parity unit
-# selected loads it. The parity units are `<component>.<model>` of these three layers.
+# The Python references are not run by the tests: their outputs are recorded in test/fixtures/python/ and read back
+# (support/fixtures.jl). Running Python is only for recording them again, which takes `LTA_GENERATE_FIXTURES=true`, PyCall
+# and torch (see test/python/README.md).
 const PARITY_COMPONENTS = ("attention", "triangle_attention", "triangle_multiplication")
-if any(named(c; model=m) for c in PARITY_COMPONENTS, m in MODELS)
+include("support/fixtures.jl")
+if GENERATE_FIXTURES
     include("python/setup.jl")
+    include("python/references.jl")
 end
 
 include("support/convert_types.jl")    # convert_types — shared with test/layers/ and test/ext/

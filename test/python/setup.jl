@@ -1,11 +1,14 @@
 import Pkg
 
-python_path = abspath(joinpath(@__DIR__, "..", "..", "python", "tri-attn", "bin", "python"))
+# PyCall is in its own environment (test/python/Project.toml), stacked on the test one, so that a test run does not build it.
+python_env = @__DIR__
+python_path = abspath(joinpath(python_env, "..", "..", "python", "tri-attn", "bin", "python"))
+python_env in LOAD_PATH || push!(LOAD_PATH, python_env)
 
 ENV["PYTHON"] = python_path
 # Rebuilding PyCall on every include is slow and, with several workers starting at once, racy: only when it is not yet built for this Python.
 let deps = joinpath(dirname(dirname(Base.find_package("PyCall"))), "deps", "deps.jl")
-    isfile(deps) && occursin(python_path, read(deps, String)) || Pkg.build("PyCall")
+    isfile(deps) && occursin(python_path, read(deps, String)) || Pkg.activate(() -> Pkg.build("PyCall"), python_env)
 end
 
 using PyCall

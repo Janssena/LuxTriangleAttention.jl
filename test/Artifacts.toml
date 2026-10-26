@@ -1,0 +1,7 @@
+[python_fixtures]
+git-tree-sha1 = "a9047abd20396d742d0ba10765161ad9af105435"
+lazy = true
+
+    [[python_fixtures.download]]
+    sha256 = "70d1ed4b766f7cf3121d6e6b1431242789933984a93ecb57304e7303d3beab9a"
+    url = "https://github.com/Janssena/LuxTriangleAttention.jl/releases/download/test-fixtures-v1/python_fixtures.tar.gz"
