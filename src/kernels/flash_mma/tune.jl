@@ -65,6 +65,11 @@ configuration for `T` there (CUDA, Float32).
 """
 mma_operand_types(be, ::Type{T}) where {T} = T === Float32 ? DataType[Float32] : DataType[Float32, T]
 
+# Whether the matrix units can run a head dimension: it is the contraction width of `Q·Kᵀ`, so a multiple of `FK` (8 on Metal,
+# 16 on NVIDIA, where AlphaFold-style heads of 8 channels therefore run `:default`). It is `FN`-multiples that make a
+# head dimension valid at all (`tune_flash_mma!` refuses the rest).
+mma_dim_runs(dim::Integer) = dim % last(mma_frag_shape()) == 0
+
 """
     mma_compute_type(be, T) -> Union{DataType,Nothing}
 
@@ -161,7 +166,8 @@ flash_mma_config(::Type{T}, dim::Integer, n::Integer) where {T} = tuned_config(F
 [`tune!`](@ref)`(FlashMMA(), lengths; dim, T, force)`: tune, compile and register the matrix-unit kernel
 `:$FLASH_MMA_NAME` at each length in `lengths`; select it with `use_kernel!(:$FLASH_MMA_NAME)`. A call of
 any length runs the closest tuned one; an eager call with none tunes [`tune_lengths`](@ref) lazily, a
-traced one refuses. `dim` must be a multiple of the device's fragment contraction width (8 on Metal, 16 on NVIDIA).
+traced one refuses. `dim` must be a multiple of 8, and of the device's contraction width (8 on Metal, 16 on NVIDIA) to run
+on the matrix units; other multiples of 8 run `:default`.
 Where the device computes `T` at another type (Float32 at Float16 on CUDA, see `mma_compute_type`) that type is tuned; where
 it has none, a call runs `:default` and this returns without tuning.
 """
@@ -169,11 +175,11 @@ function tune_flash_mma!(lengths=tune_lengths(); dim::Integer, T::Type=Float32, 
     device_kernel_available() || throw(ErrorException(
         "no usable device backend is loaded, so `:$FLASH_MMA_NAME` cannot be compiled. Load the " *
         "package for your GPU (e.g. `using Metal`) first."))
-    dim % last(mma_frag_shape()) == 0 || throw(ArgumentError(
-        "`:$FLASH_MMA_NAME` needs a head dimension that is a multiple of $(last(mma_frag_shape())) on this device; got $dim"))
+    dim % 8 == 0 || throw(ArgumentError(
+        "`:$FLASH_MMA_NAME` needs a head dimension that is a multiple of 8; got $dim"))
     Tc = mma_compute_type(mma_backend(), T)       # the type a call of storage type `T` runs at
-    if Tc === nothing
-        @info "`:$FLASH_MMA_NAME` cannot run $T on this device; nothing to tune, `:default` runs for it" maxlog = 1
+    if Tc === nothing || !mma_dim_runs(dim)
+        @info "`:$FLASH_MMA_NAME` cannot run $T with head dimension $dim on this device; nothing to tune, `:default` runs for it" maxlog = 1
         return KernelDispatch.variants(SDPA(), FlashMMA())
     end
     return tune!(FlashMMA(), lengths; dim, T=Tc, force)

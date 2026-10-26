@@ -42,6 +42,7 @@ const LTAt = LuxTriangleAttention
         @test LTAt.mma_operand_types(KernelDispatch.CPUBackend(), Float16) == [Float32, Float16]
         @test LTAt._mma_shape(KernelDispatch.CPUBackend()) == (8, 8, 8)
         @test LTAt.mma_compute_type(KernelDispatch.CPUBackend(), Float32) === Float32     # a device runs T as it is by default
+        @test LTAt._mma_shape(LTAt.mma_backend()) isa NTuple{3,Int}
         # The device's thread cap filters before anything is compiled.
         tiny = LTAt.DeviceCaps(32, 128, 32768, "tiny")
         @test all(p -> LTAt.mma_threads(p) <= 128, LTAt.grid_points(MMA, :fwd, 32, Float32, tiny))

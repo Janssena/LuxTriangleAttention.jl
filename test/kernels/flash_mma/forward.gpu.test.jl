@@ -90,3 +90,24 @@ end
     ob, _ = mma_forward(big, T, shape)
     @test all(isfinite, Array(ob))
 end
+
+# A head dimension the matrix units cannot contract over (a multiple of 8 but not of `FK`: 8 on NVIDIA's 16-wide
+# contraction, the common AlphaFold head size) runs `:default`, forward and backward, in the caller's types.
+@testset "$T, head dimension 8: whatever the device runs" for T in MMA_TYPES
+    shape = (8, 2, 23, 3, 2)
+    c = mma_case(T, shape, true, true)
+    tune_flash_mma!(23; dim=8, T)                  # a no-op where the head dimension does not run
+    op, kern = MMA()
+    o, lse = KernelDispatch.forward(op, kern, c.d(c.q), c.d(c.k), c.d(c.v), c.d(c.mask), c.d(c.bias))
+    @test eltype(o) === T && eltype(lse) === Float32
+    f64(x) = x === nothing ? nothing : Float64.(x)
+    ref_o, _ = reference_sdpa(f64(c.q), f64(c.k), f64(c.v), c.mask, f64(c.bias))
+    @test relL2_mma(Array(o), ref_o) < tol_fwd(T)
+    g = KernelDispatch.backward(op, kern, (c.d(c.q), c.d(c.k), c.d(c.v), c.d(c.mask), c.d(c.bias)),
+        (o, lse), (c.d(c.dO), nothing))
+    ref = mma_reference_grads(c)
+    for (a, r) in zip((g[1], g[2], g[3], g[5]), ref)
+        @test eltype(a) === T
+        @test relL2_mma(Array(a), r) < tol_bwd(T)
+    end
+end

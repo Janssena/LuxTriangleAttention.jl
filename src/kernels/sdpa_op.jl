@@ -212,7 +212,7 @@ end
 function KernelDispatch.forward(op::SDPA, k::FlashMMA, q0, k0, v0, mask, bias)
     T = eltype(q0)
     Tc = mma_compute_type(mma_backend(), T)
-    Tc === nothing && return _mma_fallback_forward(op, q0, k0, v0, mask, bias)
+    (Tc === nothing || !mma_dim_runs(size(q0, 1))) && return _mma_fallback_forward(op, q0, k0, v0, mask, bias)
     if Tc !== T
         o, lse = _mma_forward(op, k, _narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask, _narrow(Tc, bias))
         return _widen(T, o), lse
@@ -245,7 +245,8 @@ end
 function KernelDispatch.backward(op::SDPA, k::FlashMMA, (q0, k0, v0, mask, bias), (o, lse), (dO, _))
     T = eltype(q0)
     Tc = mma_compute_type(mma_backend(), T)
-    isnothing(Tc) && return _mma_fallback_backward(op, (q0, k0, v0, mask, bias), (o, lse), (dO, nothing))
+    (isnothing(Tc) || !mma_dim_runs(size(q0, 1))) &&
+        return _mma_fallback_backward(op, (q0, k0, v0, mask, bias), (o, lse), (dO, nothing))
     if Tc !== T
         dq, dk, dv, _, db = _mma_backward(op, k, (_narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask,
             _narrow(Tc, bias)), (_narrow(Tc, o), lse), (_narrow(Tc, dO), nothing))
@@ -282,11 +283,11 @@ _widen(::Type, ::Nothing) = nothing
 _widen(::Type{T}, x::AbstractArray) where {T} = eltype(x) === T ? x : T.(x)
 
 function _mma_fallback_forward(op, args...)
-    @info "`:flash_mma` cannot run this storage type on this device; running `:default`" maxlog = 1
+    @info "`:flash_mma` cannot run this storage type or head dimension on this device; running `:default`" maxlog = 1
     return KernelDispatch.forward(op, FlashScalar(), args...)
 end
 function _mma_fallback_backward(op, args...)
-    @info "`:flash_mma` cannot run this storage type on this device; running `:default`" maxlog = 1
+    @info "`:flash_mma` cannot run this storage type or head dimension on this device; running `:default`" maxlog = 1
     return KernelDispatch.backward(op, FlashScalar(), args...)
 end
 
