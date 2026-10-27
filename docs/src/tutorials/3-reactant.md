@@ -96,7 +96,7 @@ a host array and the layer takes the host path):
 
 ```julia
 using Reactant, Metal
-Reactant.set_default_backend(client)         # the jax-mps client, see test/mps_client.jl
+Reactant.set_default_backend(client)         # the jax-mps client, see test/mps_client.jl (it finds the plugin via JAX_MPS_PLUGIN)
 ```
 
 Three things to know:
