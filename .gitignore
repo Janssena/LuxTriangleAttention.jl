@@ -1,0 +1,18 @@
+.DS_Store
+Manifest.toml
+**/Manifest.toml
+*.log
+
+# docs/ holds design notes (docs/*.md, docs/done/); only the documentation site is tracked
+docs/*.md
+docs/build/
+docs/done/
+python
+!test/python/
+!test/fixtures/python/
+scripts
+test/bench/kernels/.bench_kernel_cache
+test/bench/kernels/*.csv
+test/*.csv
+test/fixtures/
+test/scratch/
