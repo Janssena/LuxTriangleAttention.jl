@@ -7,7 +7,7 @@
 # `device_call` was removed from KernelDispatch.jl (see `metal/flash_mma.test.jl` for the `ka_compile` replacement).
 
 # XLA multiplies Float32 matrices at TF32 precision on NVIDIA GPUs from Ampere on (its default `dot_general` precision): a
-# relative error of ~3e-4 against Float32 (measured on an A40, test/scratch/cuda_traced_spike.jl), which the Float32 tolerances of
+# relative error of ~3e-4 against Float32 (measured on an A40), which the Float32 tolerances of
 # the traced tests do not allow and which says nothing about this package. The Reactant units therefore run at HIGHEST precision
 # on CUDA, so what they measure is our code. (Metal and the CPU client multiply in full Float32 already.)
 function reactant_exact(f)
