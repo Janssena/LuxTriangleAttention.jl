@@ -6,8 +6,8 @@ CurrentModule = LuxTriangleAttention
 
 The ordinary attention path computes the whole score tensor. For a pair representation that is O(N³·H) memory, and
 it is the part of a Pairformer block that does not fit at large N. A *fused* kernel tiles the keys inside the GPU
-kernel (the FlashAttention scheme) and never materialises the scores. This package ships two of them for Apple GPUs
-and the means to tune and replace them.
+kernel (the FlashAttention scheme) and never materialises the scores. This package ships two of them, for Apple GPUs (Metal)
+and NVIDIA GPUs (CUDA), and the means to tune and replace them.
 
 ## Turning it on
 
@@ -17,7 +17,7 @@ using Lux, LuxTriangleAttention, Metal, Random
 attn = TriangleAttention(128, 32, 4; use_kernel=true)
 ps, st = Lux.setup(Random.default_rng(), attn)
 
-dev = Lux.gpu_device()                           # Metal, once Metal.jl is loaded
+dev = Lux.gpu_device()                           # Metal (or CUDA: `using CUDA`), once its package is loaded
 ps, st = dev(ps), dev(st)
 x = dev(randn(Float32, 128, 256, 256, 1))
 y, st = attn(x, ps, st)
@@ -41,7 +41,7 @@ package registers two kernels for it:
 | name | what |
 |:--|:--|
 | `:default` | a KernelAbstractions flash kernel, one thread per query |
-| `:flash_mma` | the matrix-unit variant (Apple `simdgroup` matrices), with a head dimension that is a multiple of 8 |
+| `:flash_mma` | the matrix-unit variant: Apple `simdgroup` matrices, or NVIDIA tensor cores (see [NVIDIA GPUs](#NVIDIA-GPUs)) |
 
 ```julia
 list_kernels()                 # the kernels, their variant counts and the selected one
@@ -65,6 +65,41 @@ preference and applies from the next session):
 using KernelDispatch
 set_default_kernel!(SDPA, :flash_mma)
 ```
+
+## NVIDIA GPUs
+
+Load CUDA.jl next to this package (`using CUDA`) and both kernels run on the GPU through the same calls as on Metal.
+The tensor-core kernel `:flash_mma` uses `mma.sync` (m16n8k16), which exists from Ampere (compute capability 8.0) on; an
+older GPU runs `:default`. What differs from Metal:
+
+- **Head dimension.** The tensor cores contract over 16 channels, so `:flash_mma` takes a head dimension that is a
+  multiple of 16 (Metal: 8). Other heads, the AlphaFold size 8 among them, run `:default`; measured on an A40, padding 8 to
+  16 does not pay in Float16 and Float32 and does in BFloat16.
+- **Storage types.** Float16 and BFloat16 run on the tensor cores as they are. Float32 data runs at **Float16**: the
+  kernel rounds its inputs to Float16, accumulates in Float32 and returns Float32. The rounding saturates at ±65504 (a
+  mask written as a `-1e9` bias stays a mask), and the accuracy is that of Float16 storage, about 1e-3 relative.
+  Use `:default` where Float32 must stay exact.
+- **Fallback.** A call that selected `:flash_mma` for something it cannot run (a head dimension, a type, a GPU without
+  tensor cores) runs `:default` and says so once. `tune_flash_mma!` for such a case does nothing.
+- **Shared memory.** KernelAbstractions' local memory is static, which CUDA caps at 48 KiB per block whatever the device
+  offers, so the tuner's admissible configurations are bounded by that.
+- **Compiling.** A CUDA binary is built without CUDA.jl's runtime state, so that XLA can launch the same file from a
+  Reactant trace; a kernel whose code can throw (a bounds check, an integer conversion that can overflow, a division by a
+  runtime zero) is refused when it is built. The built-in kernels are written for that: indices are converted with
+  truncation, divisions by launch parameters are unchecked, and the group index is decoded by hand.
+
+**Speed.** Measured on an NVIDIA A40 on triangle-attention shapes (4 heads, n = 128–384, head dimensions 16–64), `:flash_mma`
+against `:default`, forward and backward:
+
+| storage | forward | backward |
+|:--|--:|--:|
+| Float16 | 1.5–2.3× | 1.7–2.7× |
+| BFloat16 | 2.4–4.4× | 1.9–3.3× |
+| Float32 (computed at Float16) | 1.1–1.6× | 1.4–1.6× |
+
+The Float32 rows include rounding the inputs and widening the results in separate passes. These kernels reach roughly 10–17
+TFLOP/s, far below the tensor-core peak: they are a first version, written for correctness, and the benchmark that
+produced the table is `test/bench/kernels/cuda.bench.jl`.
 
 ## Tuning
 

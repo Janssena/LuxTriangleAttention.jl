@@ -11,7 +11,7 @@ protein structure prediction models such as AlphaFold and Boltz.
 - [`TriangleMultiplication`](@ref): outgoing and incoming triangle multiplication (AlphaFold2 Algorithms 11 and 12).
 - [`Attention`](@ref): the multi-head attention both are built on, usable on its own (self- and cross-attention,
   gating, pair bias, masks).
-- Fused attention kernels for Apple GPUs, tuned for your device, that run eagerly and inside a
+- Fused attention kernels for Apple (Metal) and NVIDIA (CUDA) GPUs, tuned for your device, that run eagerly and inside a
   [Reactant](https://github.com/EnzymeAD/Reactant.jl)-compiled program.
 - Float16 and BFloat16 that stay finite on real activations.
 - Numerically verified against the PyTorch references of AlphaFold2, AlphaFold3 and Boltz2.
@@ -76,8 +76,10 @@ and the built-in kernels are two of its kernels. Bringing your own is the
 ## Backends
 
 - **Layers**: ordinary Julia on any array type Lux supports, on the host or a GPU, and compiled with Reactant
-  (CPU, or an Apple GPU through the jax-mps PJRT plugin).
-- **Fused kernels**: `:default` and `:flash_mma` run on Metal. On the host, `use_kernel=true` runs the ordinary
-  softmax attention, so a model built for the GPU still runs on the CPU. On any other device the kernel has to be
-  [your own](tutorials/5-custom-kernels.md) (a `.cubin`, say); KernelDispatch supports CUDA, but this package does
-  not build kernels for it.
+  (CPU, an NVIDIA GPU through Reactant's own client, or an Apple GPU through the jax-mps PJRT plugin).
+- **Fused kernels**: `:default` (scalar) and `:flash_mma` (matrix units) run on Metal and on CUDA: load `Metal` or `CUDA`
+  next to this package. On NVIDIA hardware `:flash_mma` uses the tensor cores (Ampere, sm_80, and newer) in Float16 and
+  BFloat16; Float32 data runs at Float16 there (inputs rounded, results returned as Float32), and a head dimension
+  that is not a multiple of 16 runs `:default`. [Fused attention kernels](tutorials/2-fused-kernels.md) has the details.
+  On the host, `use_kernel=true` runs the ordinary softmax attention, so a model built for the GPU still runs on the
+  CPU. On any other device the kernel has to be [your own](tutorials/5-custom-kernels.md).

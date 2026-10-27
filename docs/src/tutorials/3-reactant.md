@@ -89,7 +89,8 @@ Chunk sizes that do not divide the axis fall back to the unrolled form, with the
 
 ## Fused kernels in a compiled program
 
-With `use_kernel=true` and a Metal client the kernel is embedded as a `stablehlo.custom_call` that jax-mps runs. This
+With `use_kernel=true` and a GPU client the kernel is embedded as a `stablehlo.custom_call`: on Metal one that jax-mps runs,
+on NVIDIA hardware one to XLA's kernel-call handler (Reactant's own client, no setup). On Metal this
 needs the Metal PJRT client to be the default (Reactant's own default is the CPU client, under which a traced array is
 a host array and the layer takes the host path):
 
@@ -98,16 +99,41 @@ using Reactant, Metal
 Reactant.set_default_backend(client)         # the jax-mps client, see test/mps_client.jl
 ```
 
-Two things to know:
+Three things to know:
 
 - **Tune ahead of `@compile`.** Compiling a kernel is eager device work, which the tracer would capture, so a missing
   variant cannot be built mid-trace and the compile throws, naming the call to run. `tune_flash_kernel!` (or
   `tune_flash_mma!`) once, for the head dimension and storage type you compile with; any lengths will do, since a call
   runs the closest tuned one. See [Fused attention kernels](2-fused-kernels.md#Tuning).
+- **KernelDispatch must declare layouts (CUDA).** XLA's GPU compiler may hand a kernel an operand it computed itself (the
+  transposed pair bias, or q, k, v after the projections) in another memory order unless the custom call says every
+  operand is dense in the default layout. KernelDispatch declares that (`operand_layouts` / `result_layouts`; see its
+  *Traced launches* page), and a KernelDispatch without it silently returns wrong values for a fused kernel compiled
+  with Reactant on an NVIDIA GPU: the symptom is a relative error of order 1 whenever a bias is present, while eager calls
+  are exact. The traced kernel tests (`test/ext/reactant/`) check it on every run.
 - **Forward only.** A gradient traced *through* a kernel throws until Enzyme-JAX can differentiate a custom call
   ([EnzymeAD/Enzyme#2516](https://github.com/EnzymeAD/Enzyme/issues/2516)). To train under Reactant use the
   unfused layer (optionally with `chunk_size`), and use the kernel for inference. You can still call the kernels'
   `backward` directly.
+
+## Float32 on NVIDIA GPUs: TF32
+
+XLA multiplies Float32 matrices at **TF32 precision** by default on NVIDIA GPUs from Ampere on (the default `dot_general`
+precision): about 3e-4 relative error against Float32, measured on an A40 for compiled attention. This is the compiler's
+choice, not this package's, and it applies to every matrix product in a compiled program (the projections and the plain
+softmax path; the fused kernels do their own arithmetic). To compile with full Float32 products, set the precision for the
+trace:
+
+```julia
+using Reactant
+Reactant.with_config(dot_general_precision=Reactant.PrecisionConfig.HIGHEST,
+                     convolution_precision=Reactant.PrecisionConfig.HIGHEST) do
+    compiled = @compile model(x, ps, st)
+    compiled(x, ps, st)
+end
+```
+
+The package's own Reactant tests run this way on CUDA. Metal (jax-mps) and the CPU client multiply in Float32 already.
 
 ## Float16
 
