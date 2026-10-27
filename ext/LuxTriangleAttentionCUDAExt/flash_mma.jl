@@ -3,7 +3,7 @@
 # tuning the stages is backend-agnostic (`src/kernels/launch.jl`, `src/kernels/tune.jl`).
 #
 # One product is `C[16×8] += A[16×16]·B[16×8]`; with g = lane÷4 and t = lane%4, a lane holds (the layout is
-# pinned by `test/ext/cuda/flash_mma.test.jl`, and was measured by `test/scratch/cuda_spike.jl`):
+# pinned by `test/ext/cuda/flash_mma.test.jl`, and was measured on an A40):
 #
 #   C (4 × Float32)   c0, c1 = C[g, 2t], C[g, 2t+1]          c2, c3 = C[g+8, 2t], C[g+8, 2t+1]
 #   A (4 × 2 packed)  a0 = A[g, 2t..2t+1]    a1 = A[g+8, 2t..]    a2 = A[g, 2t+8..2t+9]    a3 = A[g+8, 2t+8..]
