@@ -33,3 +33,23 @@ end
         @test relL2_mma(Array(a), r) < tol_bwd(Tc) * 4
     end
 end
+
+# Repeatability: the same inputs through the same backward, `REPEATS` times, must give bit-identical gradients. A key-tile (`dK`,
+# `dV`) or query-row (`dQ`) thread owns its output, so those are deterministic by construction. `dbias` sums over the outer axis
+# with float atomics, whose order is the scheduler's: it is required to repeat only once `DBIAS_DETERMINISTIC` says it does, and
+# until then the number of distinct results is reported. A large outer extent, so that many atomics hit each address.
+@testset "repeatability, $T, bias=$hb" for T in MMA_TYPES, hb in (true, false)
+    shape = (32, 2, 96, 96, 1)
+    REPEATS = 5
+    c = mma_case(T, shape, hb, true)
+    o, lse = mma_forward(c, T, shape)
+    runs = [Tuple(x === nothing ? nothing : Array(x) for x in mma_backward(c, o, lse)) for _ in 1:REPEATS]
+    for (i, name) in enumerate((:dq, :dk, :dv))
+        @test all(r -> isequal(r[i], runs[1][i]), runs)
+    end
+    if hb
+        distinct = length(unique(r[4] for r in runs))
+        DBIAS_DETERMINISTIC ? (@test distinct == 1) :
+            @info "dbias repeatability ($T): $distinct distinct result(s) in $REPEATS runs"
+    end
+end
