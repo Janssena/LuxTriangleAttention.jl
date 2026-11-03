@@ -89,6 +89,26 @@ first), so a `B` block is read down its columns.
 function _mma_load_a end
 function _mma_load_b end
 
+"""
+    _mma_smem_ld(be, n) -> Int
+
+The leading dimension (rows, column-major) of a local array whose `B` operands are read with [`_mma_load_b`], for a
+matrix of `n` rows. Defaults to `n`. A backend whose shared memory has banks pads it so that the lanes of one fragment
+load fall in different banks (CUDA: `n + 8`, which also keeps every column 16-byte aligned for `ldmatrix`). Only the
+leading dimension changes: kernels index `a[row, col]` as before, and [`mma_shmem`] accounts for the padding.
+"""
+_mma_smem_ld(be, n::Integer) = n
+
+"""
+    _mma_stage_bias(be) -> Bool
+
+Whether the forward stages each key tile's pair bias in local memory, with one coalesced load per tile, and reads it in
+the lane layout of the score fragments from there ([`_mma_bias2s`]), instead of every lane loading its two keys from
+device memory ([`_mma_bias2`], the default). The tile costs `FM·R·NSG × (tile + 8)` entries of local memory
+(accounted for in [`mma_shmem`]).
+"""
+_mma_stage_bias(be) = false
+
 """`_mma_zero(be, E)`: a fragment of zeros of element type `E`, valid as an accumulator."""
 function _mma_zero end
 
@@ -175,13 +195,22 @@ end
            Float32(unsafe_load(bias, rowoff + k2 + Int32(1))) * _LOG2E
 end
 
+# The same, from the staged tile `bs[key, query]` (`_mma_stage_bias`): the lane's query row `rl` (0-based in the group's
+# tile) and its two keys `c`, `c+1` (0-based in the key tile). Out-of-range entries were staged as zero.
+@inline function _mma_bias2s(bs, rl, c, ::Val{HB}) where {HB}
+    HB || return 0f0, 0f0
+    return Float32(@inbounds(bs[c+Int32(1), rl+Int32(1)])) * _LOG2E,
+           Float32(@inbounds(bs[c+Int32(2), rl+Int32(1)])) * _LOG2E
+end
+
 # ---------------------------------------------------------------------------------------------
 # Forward
 # ---------------------------------------------------------------------------------------------
 
-# One key tile for the R query fragments of this simdgroup. `st[u] = (m, l)` of this lane's row slot `u`.
-@generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, ::Val{SH}, ::Val{R},
-    ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {SH,R,DIM,BK,HB}
+# One key tile for the R query fragments of this simdgroup. `st[u] = (m, l)` of this lane's row slot `u`. The bias comes
+# from device memory (`bias`, rows `bbs`) or, with `SB`, from the staged tile (`bs`, local rows `brs`).
+@generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, bs, brs, t, n, col, ::Val{SH}, ::Val{R},
+    ::Val{DIM}, ::Val{BK}, ::Val{HB}, ::Val{SB}) where {SH,R,DIM,BK,HB,SB}
     FM, FN, FK = SH
     NR, NKD, NKB, NKK, NDN, NB = FM ÷ 8, DIM ÷ FK, BK ÷ FN, BK ÷ FK, DIM ÷ FN, FK ÷ FN
     body = Expr[]
@@ -208,7 +237,8 @@ end
                 push!(body, quote
                     $a, $b = _mma_pair(be, $(acc(kb)), $s)
                     c = Int32($(FN * kb)) + col
-                    b1, b2 = _mma_bias2(bias, bbs[$u], t + c, n, Val(HB))
+                    b1, b2 = $(SB ? :(_mma_bias2s(bs, brs[$u], c, Val(HB))) :
+                                    :(_mma_bias2(bias, bbs[$u], t + c, n, Val(HB))))
                     $a += b1 + @inbounds(ms[c+Int32(1)])
                     $b += b2 + @inbounds(ms[c+Int32(2)])
                 end)
@@ -310,10 +340,12 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
     FM, FN, FK = shp
     U = R * (FM ÷ 8)                       # row slots this lane holds
     BQ = FM * R * NSG
+    SB = HB && _mma_stage_bias(be)         # the bias tile is staged in local memory
     qs = @localmem T (BQ, DIM)
-    ks = @localmem T (DIM, BK)
-    vs = @localmem PE (BK, DIM)
+    ks = @localmem T (_mma_smem_ld(be, DIM), BK)
+    vs = @localmem PE (_mma_smem_ld(be, BK), DIM)
     ms = @localmem Float32 (BK,)
+    bs = SB ? @localmem(T, (_mma_smem_ld(be, BK), BQ)) : nothing
 
     NT = Int32(32 * NSG)
     g = _i32(@index(Group, Linear)) - Int32(1)
@@ -348,6 +380,7 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
     O = _mma_zeros(be, Val(shp), Val(R), Val(DIM))
     st = ntuple(_ -> (_MMA_NEG, 0f0), Val(U))
     bbs = _mma_bias_rows(bh, n, j0, Val(U))
+    brs = ntuple(u -> r0 + fr + Int32(8 * (u - 1)), Val(U))     # this lane's rows in the staged bias tile
 
     t = Int32(0)
     while t < n
@@ -360,6 +393,16 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
             @inbounds vs[c+Int32(1), d+Int32(1)] = kk < n ? PE(Float32(unsafe_load(v, off))) : zero(PE)
             e += NT
         end
+        if SB
+            # bias[key, query j, bh] at (bh·n + j)·n + key: consecutive threads take consecutive keys of a query row
+            e = tid
+            while e < Int32(BQ * BK)
+                c = e % Int32(BK); r = e ÷ Int32(BK); j = q0 + r; kk = t + c
+                @inbounds bs[c+Int32(1), r+Int32(1)] =
+                    (j < n && kk < n) ? unsafe_load(bias, (bh * n + j) * n + kk + Int32(1)) : zero(T)
+                e += NT
+            end
+        end
         e = tid
         while e < Int32(BK)
             kk = t + e
@@ -368,7 +411,8 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
             e += NT
         end
         @synchronize
-        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, t, n, col, Val(shp), Val(R), Val(DIM), Val(BK), Val(HB))
+        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, bs, brs, t, n, col, Val(shp), Val(R), Val(DIM), Val(BK),
+            Val(HB), Val(SB))
         t += Int32(BK)
     end
     _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, (bi * nouter + i) * nh + hi, col,

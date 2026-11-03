@@ -112,10 +112,10 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
     FM, FN, FK = shp
     U = R * (FM ÷ 8)                       # row slots (keys) this lane holds
     BKV = FM * R * NSG
-    qT = @localmem T (DIM, BQ)
-    dT = @localmem T (DIM, BQ)
-    qN = @localmem PE (BQ, DIM)         # B operands of dS·Q and P·dO, against P/dS in `PE`
-    dN = @localmem PE (BQ, DIM)
+    qT = @localmem T (_mma_smem_ld(be, DIM), BQ)
+    dT = @localmem T (_mma_smem_ld(be, DIM), BQ)
+    qN = @localmem PE (_mma_smem_ld(be, BQ), DIM)         # B operands of dS·Q and P·dO, against P/dS in `PE`
+    dN = @localmem PE (_mma_smem_ld(be, BQ), DIM)
     sd = @localmem Float32 (DIM,)       # a dead slice's running Σⱼ dO[j], always Float32
     ls = @localmem Float32 (BQ,)
     dl = @localmem Float32 (BQ,)
@@ -331,9 +331,9 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
     U = R * (FM ÷ 8)                       # row slots (queries) this lane holds
     BQ = FM * R * NSG
     qs = @localmem T (BQ, DIM)
-    ks = @localmem T (DIM, BK)     # Kᵀ for S = Q·Kᵀ
-    vT = @localmem T (DIM, BK)     # Vᵀ for dP = dO·Vᵀ
-    kn = @localmem PE (BK, DIM)    # K for dQ = dS·K, against dS in `PE`
+    ks = @localmem T (_mma_smem_ld(be, DIM), BK)     # Kᵀ for S = Q·Kᵀ
+    vT = @localmem T (_mma_smem_ld(be, DIM), BK)     # Vᵀ for dP = dO·Vᵀ
+    kn = @localmem PE (_mma_smem_ld(be, BK), DIM)    # K for dQ = dS·K, against dS in `PE`
     ms = @localmem Float32 (BK,)
 
     NT = Int32(32 * NSG)

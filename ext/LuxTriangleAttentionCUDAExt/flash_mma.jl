@@ -63,8 +63,21 @@ LTA.mma_compute_type(::CUDABackendTag, ::Type{T}) where {T} =
     return AFrag{E}((a0, a1, a2, a3))
 end
 
+# The knobs of the shared-memory path, each reproducing the plain kernel when switched off (measure one at a time, see
+# docs/cuda_kernel_speed_improvements.md): `SMEM_PAD` entries added to the leading dimension of every `B`-operand array, so
+# the eight lanes `g` of a fragment load fall in different banks; `LDMATRIX` loads a `B` fragment with one `ldmatrix`;
+# `STAGE_BIAS` stages the forward's bias tile in local memory. Changing one needs the package to be recompiled.
+const SMEM_PAD = 8
+const LDMATRIX = true
+const STAGE_BIAS = true
+
+# A column starts 16-byte aligned (what `ldmatrix` needs) when the leading dimension is a multiple of 8 entries, and the 8
+# columns of a block then spread over all banks when it is 8 mod 16 (`n + 8` for the head dimensions and tiles used here).
+LTA._mma_smem_ld(::CUDABackendTag, n::Integer) = n + SMEM_PAD
+LTA._mma_stage_bias(::CUDABackendTag) = STAGE_BIAS
+
 # `B[k, n]` is `a[r + k, c + n]`: the two entries of a register are adjacent in memory.
-@inline function LTA._mma_load_b(::CUDABackendTag, a, r, c)
+@inline function _mma_load_b_scalar(a, r, c)
     g = _lane() >> Int32(2)
     t = _lane() & Int32(3)
     E = eltype(a)
@@ -74,6 +87,25 @@ end
     end
     return BFrag{E}((b0, b1))
 end
+
+# `ldmatrix.x2` reads two 8×8 blocks of 16-bit entries, a row of 8 consecutive entries (16 bytes) per address; thread
+# `l` of the warp then holds row `l÷4`, entries `2(l%4)`, `+1` of each block: for `B` that is `B[2t..2t+1, g]` (block 0,
+# `k` = 0…7) and `B[2t+8..2t+9, g]` (block 1, `k` = 8…15), the registers `b0`, `b1` of `mma.sync`. Our local arrays hold `k`
+# consecutively in a column, so the "row" of a block is the column `c + n` of `a` and nothing needs transposing. Lanes 0-7
+# give the addresses of block 0, lanes 8-15 those of block 1 (lanes 16-31 are ignored; they repeat 0-15).
+@inline function _ldmatrix_x2(addr::UInt32)
+    return Interop.@asmcall("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {\$0, \$1}, [\$2];", "=r,=r,r", true,
+        NTuple{2,UInt32}, Tuple{UInt32}, addr)
+end
+
+@inline function _mma_load_b_ldmatrix(a, r, c)
+    l = _lane() & Int32(15)
+    idx = (r + (l >> Int32(3)) * Int32(8)) + (c + (l & Int32(7)) - Int32(1)) * size(a, 1)
+    addr = UInt32(UInt(pointer(a, idx)) & 0xffffffff)       # a shared address is 32 bits wide
+    return BFrag{eltype(a)}(_ldmatrix_x2(addr))
+end
+
+@inline LTA._mma_load_b(::CUDABackendTag, a, r, c) = LDMATRIX ? _mma_load_b_ldmatrix(a, r, c) : _mma_load_b_scalar(a, r, c)
 
 @inline LTA._mma_zero(::CUDABackendTag, ::Type{Float32}) = (0.0f0, 0.0f0, 0.0f0, 0.0f0)
 

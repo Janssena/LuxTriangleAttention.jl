@@ -89,9 +89,12 @@ Local memory one group of `stage` uses at `cfg`, in bytes (see each kernel's `@l
 """
 function mma_shmem(stage::Symbol, dim::Integer, ::Type{T}, c) where {T}
     st, sp, rows, b = sizeof(T), sizeof(mma_ops(c)), mma_rows(c), c.tile   # sp: the `PE` operand tiles
-    stage === :fwd && return st * (rows * dim + dim * b) + sp * b * dim + 4b
-    stage === :dkv && return st * (2 * dim * b + rows * dim) + sp * 2 * dim * b + 8b + 4dim
-    stage === :dq && return st * (rows * dim + 2 * dim * b) + sp * dim * b + 4b
+    be = mma_backend()
+    ld(n) = _mma_smem_ld(be, n)                                            # padded leading dimensions
+    stage === :fwd && return st * (rows * dim + ld(dim) * b) + sp * ld(b) * dim + 4b +
+                             (_mma_stage_bias(be) ? st * ld(b) * rows : 0)   # (the bias tile, whether or not a call has bias)
+    stage === :dkv && return st * (2 * ld(dim) * b + rows * dim) + sp * 2 * ld(b) * dim + 8b + 4dim
+    stage === :dq && return st * (rows * dim + 2 * ld(dim) * b) + sp * ld(b) * dim + 4b
     throw(ArgumentError("unknown stage `:$stage`"))
 end
 

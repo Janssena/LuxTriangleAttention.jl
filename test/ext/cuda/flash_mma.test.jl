@@ -4,7 +4,8 @@
 # a hook disagrees with it, so it is pinned here through the very hooks the kernel calls: one warp loads `A` (16×16)
 # and two `B` blocks (16×8) from local memory, forms the two scores `S1`, `S2` (16×8 each), reduces every row of
 # `[S1 S2]` across the lanes that hold it, rounds the scores into the next product's operand (`_mma_pfrag`) and
-# multiplies it by a `V` block. All of it is compared with the same arithmetic on the host.
+# multiplies it by a `V` block. All of it is compared with the same arithmetic on the host. The `B` blocks sit in arrays with
+# the padded leading dimension the kernels use (`_mma_smem_ld`), so the `ldmatrix` loads are tested at their real strides.
 
 using LuxTriangleAttention.KernelAbstractions
 import KernelDispatch
@@ -38,8 +39,8 @@ end
     be = KernelDispatch.CUDABackendTag()
     l = LTA._i32(@index(Local, Linear)) - Int32(1)
     aS = @localmem E (16, 16)
-    bS = @localmem E (16, 16)
-    vS = @localmem E (16, 8)
+    bS = @localmem E (LTA._mma_smem_ld(be, 16), 16)       # the `B` operands as the kernels lay them out: padded
+    vS = @localmem E (LTA._mma_smem_ld(be, 16), 8)
     for k in Int32(0):Int32(7)
         e = l + Int32(32) * k
         @inbounds aS[e%Int32(16)+Int32(1), e÷Int32(16)+Int32(1)] = unsafe_load(a, e + Int32(1))
