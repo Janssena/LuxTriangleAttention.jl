@@ -87,6 +87,15 @@ function (m::ChannelsLast{<:StableLayerNorm{<:Lux.LayerNorm}})(x::AbstractArray{
     return layernorm_f32stats(x, scale, bias, ln.activation, N, ln.epsilon, realtype(eltype(x))), st
 end
 
+# `LayerNormNoBias`: a `StableLayerNorm` around a `Lux.Experimental.FrozenLayer` whose zero bias lives in the
+# STATE (`ps = (; scale)`). The frozen parameters are merged back for the call and the state is returned as it
+# came in.
+function (m::ChannelsLast{<:StableLayerNorm{<:Lux.Experimental.FrozenLayer}})(x::AbstractArray, ps, st)
+    frozen = m.layer.layer
+    y, _ = ChannelsLast(StableLayerNorm(frozen.layer))(x, merge(ps, st.frozen_params), st.states)
+    return y, st
+end
+
 function (m::ChannelsLast{<:GatedLinearUnit{True}})(x::AbstractArray{T,N}, ps, st) where {T,N}
     glu = m.layer
     proj, _ = ChannelsLast(glu.linear)(x, ps.linear, st.linear)      # [..., 2·out]: values, then gates
