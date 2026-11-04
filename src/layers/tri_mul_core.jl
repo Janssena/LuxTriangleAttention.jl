@@ -13,6 +13,7 @@ batched matrix multiplication for edge updates.
 - `fused`: If `true`, fuses the A & B projections into a single GLU operation.
 - `fused_glu`: If `true`, uses fused GLU layers.
 - `use_bias`: Boolean for internal layer biases.
+- `layer_norm_bias`: If `false`, the output LayerNorm has a scale but no bias ([`LayerNormNoBias`](@ref)). (default: `true`)
 - `rank`: The rank (ndims) of the input.
 
 ## Inputs
@@ -34,12 +35,18 @@ struct TriMulCore{F<:StaticBool, DIR<:StaticBool, GAB, GA, GB, LNO, GOUT} <: Lux
     chn_hidden::Int
 end
 
+# The `Lux.LayerNorm` inside `ChannelsLast(StableLayerNorm(LayerNorm | FrozenLayer(LayerNorm)))`.
+_inner_layernorm(l::ChannelsLast) = _inner_layernorm(l.layer)
+_inner_layernorm(l::StableLayerNorm) = _inner_layernorm(l.layer)
+_inner_layernorm(l::Lux.Experimental.FrozenLayer) = l.layer
+_inner_layernorm(l::Lux.LayerNorm) = l
+
 function TriMulCore(
     chn_in::Int, chn_hidden::Int;
     is_outgoing::Union{Bool, StaticBool}=static(true),
     fused::Union{<:StaticBool,Bool}=static(true), 
     fused_glu::Union{<:StaticBool,Bool}=static(true),
-    layernorm_eps=1f-5, use_bias=false, rank=4, kwargs...
+    layernorm_eps=1f-5, use_bias=false, layer_norm_bias::Bool=true, rank=4, kwargs...
 )   
     fused_static = static(fused)
     
@@ -54,7 +61,10 @@ function TriMulCore(
         glu_b = ChannelsLast(GatedLinearUnit(chn_in => chn_hidden; fused=fused_glu, use_bias))
     end
 
-    layer_norm_out = ChannelsLast(StableLayerNorm((chn_hidden, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps))
+    ln_shape = (chn_hidden, ntuple(one, rank-2)...)
+    layer_norm_out = ChannelsLast(layer_norm_bias ?
+        StableLayerNorm(ln_shape; dims=1, epsilon=layernorm_eps) :
+        LayerNormNoBias(ln_shape; dims=1, epsilon=layernorm_eps))
     
     # Output Gate: Dual input (chn_hidden from Y, chn_in from X)
     glu_out = ChannelsLast(GatedLinearUnit((chn_hidden, chn_in) => chn_in; fused=false, use_bias))
@@ -115,19 +125,19 @@ _normalize_out(::FullPrecision, m, y_tok, ps, st, T) =
 # normalised in Float32 too: 1/√(σ² + ε·16⁻ᵏ) reaches 4ᵏ/√ε ≈ 1e6 for a token whose X is all zero (a
 # fully masked pair), which is `Inf` in Float16 and turns that token's 0·rstd into NaN.
 _normalize_out(mode::Folded, m, y_tok, ps, st, T) =
-    _layer_norm_out_f32(m, Float32.(y_tok), ps, Float32(m.layer_norm_out.layer.layer.epsilon) * 16.0f0^(-mode.k), T),
+    _layer_norm_out_f32(m, Float32.(y_tok), ps, Float32(_inner_layernorm(m.layer_norm_out).epsilon) * 16.0f0^(-mode.k), T),
     st.layer_norm_out
 
 # `HalfSafe`: X is Float32; normalise in Float32 and narrow to the data's type.
 _normalize_out(::HalfSafe, m, y_tok, ps, st, T) =
-    _layer_norm_out_f32(m, y_tok, ps, Float32(m.layer_norm_out.layer.layer.epsilon), T),
+    _layer_norm_out_f32(m, y_tok, ps, Float32(_inner_layernorm(m.layer_norm_out).epsilon), T),
     st.layer_norm_out
 
 function _layer_norm_out_f32(m, y_tok, ps, ε, ::Type{T}) where {T}
     pl = ps.layer_norm_out
     γ = haskey(pl, :scale) ? reshape(pl.scale, 1, :) : nothing
     β = haskey(pl, :bias) ? reshape(pl.bias, 1, :) : nothing
-    return layernorm_f32stats(y_tok, γ, β, m.layer_norm_out.layer.layer.activation, 2, ε, T)
+    return layernorm_f32stats(y_tok, γ, β, _inner_layernorm(m.layer_norm_out).activation, 2, ε, T)
 end
 
 # Outgoing (AlphaFold2 Alg 11): X[i, j] = Σ_k a[i, k] b[j, k]  →  A · Bᵀ per plane

@@ -24,6 +24,7 @@ and AlphaFold2 Algorithm 12 (incoming edges) sums ``a_{ki} \odot b_{kj}`` instea
 - `is_outgoing`: If `true`, performs "Outgoing" multiplication (AlphaFold2 Algorithm 11).
   If `false`, performs "Incoming" multiplication (AlphaFold2 Algorithm 12).
 - `layernorm_eps`: Epsilon for LayerNorm.
+- `layer_norm_bias`: If `false`, both LayerNorms (input and output) have a scale but no bias. (default: `true`)
 - `rank`: The rank (ndims) of the input.
 - `kwargs...`: Passed to `TriMulCore`.
 
@@ -44,11 +45,13 @@ end
 function TriangleMultiplication(
     chn_in::Int, chn_hidden::Int;
     is_outgoing::Union{Bool, StaticBool}=static(true), rank=4,
-    layernorm_eps=1f-5, kwargs...
+    layernorm_eps=1f-5, layer_norm_bias::Bool=true, kwargs...
 )
+    ln_shape = (chn_in, ntuple(one, rank-2)...)
     return TriangleMultiplication(
-        StableLayerNorm((chn_in, ntuple(one, rank-2)...); dims=1, epsilon=layernorm_eps),
-        TriMulCore(chn_in, chn_hidden; is_outgoing, layernorm_eps, rank, kwargs...)
+        layer_norm_bias ? StableLayerNorm(ln_shape; dims=1, epsilon=layernorm_eps) :
+                          LayerNormNoBias(ln_shape; dims=1, epsilon=layernorm_eps),
+        TriMulCore(chn_in, chn_hidden; is_outgoing, layernorm_eps, layer_norm_bias, rank, kwargs...)
     )
 end
 
