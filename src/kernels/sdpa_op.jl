@@ -313,9 +313,3 @@ list_kernels() = KernelDispatch.list_kernels(SDPA)
 
 _attention_variant_key(k::BuiltinKernel, ::Type{T}, dim, n; hasbias=true, hasmask=true) where {T} =
     (nameof(T), Int(dim), Int(n), hasbias, hasmask)
-
-function _register_builtin_kernels!()
-    KernelDispatch.register_kernel!(SDPA(), FlashScalar())
-    KernelDispatch.register_kernel!(SDPA(), FlashMMA())
-    return nothing
-end

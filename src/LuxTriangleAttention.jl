@@ -40,9 +40,9 @@ include("kernels/flash/forward.jl")
 include("kernels/flash/backward.jl")
 include("kernels/flash_mma/forward.jl")
 include("kernels/flash_mma/backward.jl")
+include("kernels/trimul/kernels.jl")
 
 include("kernels/device.jl")
-export device_kernel_available
 
 include("kernels/verify.jl")
 include("kernels/launch.jl")
@@ -64,16 +64,24 @@ include("layers/triangle_multiplication.jl")
 include("layers/tri_mul_core.jl")
 export TriangleMultiplication, TriMulCore
 
+include("kernels/trimul/op.jl")
+include("kernels/trimul/backward.jl")
+export TriMul
+public TriMulStaged, trimul_tunables, set_trimul_tunables!, trimul_contraction_type
+
 """
     __init__()
 
-Register the two attention kernels this package builds itself (`:default` and `:flash_mma`) with
-KernelDispatch, which loads their tuned variants from the cache — dropping any built from other kernel
-sources. A missing variant is tuned on demand. Which one runs is `SDPA`'s `@default_kernel` (the first,
-or the package preference `kernel.sdpa`), switched for a session with `use_kernel!`.
+Register the kernels this package builds itself with KernelDispatch: the two attention kernels (`:default` and
+`:flash_mma`) and triangle multiplication's `:default`. KernelDispatch loads their variants from the cache —
+dropping any built from other kernel sources. A missing variant is tuned (attention) or compiled (triangle
+multiplication) on demand. Which one runs is each op's `@default_kernel` (the first, or the package preference
+`kernel.sdpa` / `kernel.trimul`), switched for a session with `KernelDispatch.use_kernel!`.
 """
 function __init__()
-    _register_builtin_kernels!()
+    KernelDispatch.register_kernel!(SDPA(), FlashScalar())
+    KernelDispatch.register_kernel!(SDPA(), FlashMMA())
+    KernelDispatch.register_kernel!(TriMul(), TriMulStaged())
     return nothing
 end
 
