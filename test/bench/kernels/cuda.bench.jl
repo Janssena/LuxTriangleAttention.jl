@@ -2,6 +2,7 @@
 #
 #   KERNELDISPATCH_CACHE=$(mktemp -d) julia --project=test test/bench/kernels/cuda.bench.jl 2>&1 | tee lta_cuda_bench.log
 #   LTA_BENCH=hd8 …   only the head-dimension-8 table (the quick one): is a zero-padded `:flash_mma` faster than `:default`?
+#   LTA_BENCH=main …  everything except the head-dimension-8 table
 #
 # Each cell is the GPU time of one call (CUDA events, mean of `REPS` after a warm-up), through the kernels' KernelDispatch
 # methods directly. The kernels are tuned first (`tune_flash_kernel!`, `tune_flash_mma!`), outside the timed region.
@@ -38,7 +39,9 @@ op = LTA.SDPA()
 kernels = (default=LTA.FlashScalar(), mma=LTA.FlashMMA())
 
 println("device: ", CUDA.name(CUDA.device()), "   H=$H, B=$B, triangle shapes [hd, H, n, n, B], bias and mask present")
-@printf("%-9s %4s %4s | %10s %10s %7s | %10s %10s %7s | %s\n", "type", "hd", "n", "fwd dflt", "fwd mma", "x", "bwd dflt", "bwd mma", "x", "mma config (fwd)")
+const EXT = Base.get_extension(LTA, :LuxTriangleAttentionCUDAExt)
+println("shared-memory path: smem_pad=", EXT.SMEM_PAD, " ldmatrix=", EXT.LDMATRIX, " stage_bias=", EXT.STAGE_BIAS)
+@printf("%-9s %4s %4s | %10s %10s %7s | %10s %10s %7s | %s\n", "type", "hd", "n", "fwd dflt", "fwd mma", "x", "bwd dflt", "bwd mma", "x", "mma config (fwd) [dkv] [dq]")
 for T in TYPES, hd in HEADDIMS, n in LENGTHS
     get(ENV, "LTA_BENCH", "all") == "hd8" && break         # LTA_BENCH=hd8: only the head-dimension-8 table below
     c = problem(T, hd, n)
@@ -52,7 +55,8 @@ for T in TYPES, hd in HEADDIMS, n in LENGTHS
         row[name] = (gputime(fwd), gputime(bwd))
     end
     cfg = try
-        LTA.flash_mma_config(LTA.mma_compute_type(LTA.mma_backend(), T), hd, n)[:fwd]
+        c3 = LTA.flash_mma_config(LTA.mma_compute_type(LTA.mma_backend(), T), hd, n)
+        "$(c3[:fwd]) dkv=$(c3[:dkv]) dq=$(c3[:dq])"
     catch
         "runs :default"
     end
@@ -68,6 +72,7 @@ end
 # head dimension 16: the extra channels are zeros, so it is the same attention. That is a CONSERVATIVE estimate of a real
 # padded kernel, which would still load 8 channels and run the `P·V` product over 8 output channels, where this runs both
 # over 16. "dflt@8" is `:default` at the real head dimension 8, "dflt@16" the same kernel at the padded size, for scale.
+get(ENV, "LTA_BENCH", "all") == "main" && exit(0)
 println("\nhead dimension 8: `:default` at 8 against `:flash_mma` on inputs zero-padded to 16 (an upper bound on a padded kernel's time)")
 @printf("%-9s %4s | %10s %10s %10s %7s | %10s %10s %10s %7s\n", "type", "n", "fwd dflt@8", "fwd dflt@16", "fwd mma@16", "x",
     "bwd dflt@8", "bwd dflt@16", "bwd mma@16", "x")
