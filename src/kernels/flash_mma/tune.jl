@@ -175,7 +175,7 @@ Where the device computes `T` at another type (Float32 at Float16 on CUDA, see `
 it has none, a call runs `:default` and this returns without tuning.
 """
 function tune_flash_mma!(lengths=tune_lengths(); dim::Integer, T::Type=Float32, force::Bool=false)
-    device_kernel_available() || throw(ErrorException(
+    KernelDispatch.device_available() || throw(ErrorException(
         "no usable device backend is loaded, so `:$FLASH_MMA_NAME` cannot be compiled. Load the " *
         "package for your GPU (e.g. `using Metal`) first."))
     dim % 8 == 0 || throw(ArgumentError(

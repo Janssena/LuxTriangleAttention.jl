@@ -1,9 +1,9 @@
 module LuxTriangleAttentionMetalExt
 
 # What Metal supplies to the built-in attention kernels: the device intrinsics KernelAbstractions
-# cannot express (the `dbias` atomic, `:flash_mma`'s fragment hooks) and two small hooks on
-# KernelDispatch' Metal tag (`to_device`, `device_caps`). Everything else — routing, launch,
-# timing, `ka_compile` — is KernelDispatch' Metal extension, and building, verifying and tuning the stages
+# cannot express (the `dbias` atomic, `:flash_mma`'s fragment hooks) and `TriMul`'s contraction type. Everything
+# else — routing, launch, timing, `ka_compile`, and the device tools `to_device`, `device_caps`, `release!` — is
+# KernelDispatch' Metal extension, and building, verifying and tuning the stages
 # is backend-agnostic code in the package (`src/kernels/launch.jl`, `src/kernels/tune.jl`).
 
 import Metal: AS
@@ -14,11 +14,10 @@ import KernelDispatch
 
 const LTA = LuxTriangleAttention
 
-LTA.to_device(::KernelDispatch.MetalBackendTag, x::AbstractArray) = MtlArray(x)
-
-LTA.device_caps(::KernelDispatch.MetalBackendTag) = LTA.DeviceCaps(32,
-    Int(Metal.device().maxThreadsPerThreadgroup.width),
-    Int(Metal.device().maxThreadgroupMemoryLength), String(Metal.device().name))
+# Metal.jl's 16-bit batched matrix product is 7x slower than its Float32 one (88 ms against 13 ms for TriMul's
+# contraction at N = 512), so 16-bit data contracts in Float32 here (see `trimul_contraction_type`).
+LTA.trimul_contraction_type(::KernelDispatch.MetalBackendTag, ::Type{T}, mode) where {T} =
+    LTA.ishalf(T) ? Float32 : T
 
 # The one thing `flash_bwd_dq!` needs that KernelAbstractions cannot express: an atomic add on the
 # raw pointer `dbias` (see `_atomic_fadd!`'s docstring in `flash/backward.jl`). Metal has a native

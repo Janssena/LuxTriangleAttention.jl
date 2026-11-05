@@ -86,7 +86,7 @@ collection; default [`tune_lengths`](@ref)). A call of any length runs the close
 extension.
 """
 function tune_flash_kernel!(lengths=tune_lengths(); dim::Integer, T::Type=Float32, force::Bool=false)
-    device_kernel_available() || throw(ErrorException(
+    KernelDispatch.device_available() || throw(ErrorException(
         "no usable device backend is loaded, so the built-in flash kernel cannot be compiled. " *
         "Load the package for your GPU (e.g. `using Metal`) first."))
     return tune!(FlashScalar(), lengths; dim, T, force)

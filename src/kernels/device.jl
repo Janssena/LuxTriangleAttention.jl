@@ -1,52 +1,7 @@
-# What the built-in kernels need from a device backend, as methods on KernelDispatch' backend tags. A
-# backend extension (Metal: `ext/LuxTriangleAttentionMetalExt.jl`) adds them for its own tag;
-# everything else — building, launching, verifying, timing, tuning — is backend-agnostic code in
-# `launch.jl` and `tune.jl`, on KernelDispatch' public API.
-
-"""
-    device_kernel_available() -> Bool
-
-Whether a backend extension is loaded AND its device is usable (`KernelDispatch.device_available()`).
-False on a host-only setup.
-"""
-device_kernel_available() = KernelDispatch.device_available()
-
-"""
-    DeviceCaps
-
-What a backend reports for the candidate configurations to be built. Deliberately small: anything
-that can be measured is measured rather than declared.
-
-# Fields
-- `warp`: threads per warp / wavefront / SIMD group. Group sizes are multiples of this.
-- `max_threads`: the device's ceiling on threads per group. A NECESSARY but not sufficient bound —
-  a compiled pipeline's own limit (`KernelDispatch.max_threads`) is checked per candidate.
-- `max_shmem`: bytes of local memory available to one group.
-- `name`: device identifier, used as the calibration key.
-"""
-struct DeviceCaps
-    warp::Int
-    max_threads::Int
-    max_shmem::Int
-    name::String
-end
-
-"""
-    device_caps(backend) -> DeviceCaps
-
-The device's limits. Implemented by the backend extension for its own tag.
-"""
-device_caps(be::KernelDispatch.KernelBackend) = throw(ArgumentError(
-    "no device capabilities for $(typeof(be)); load the package for that backend"))
-
-"""
-    to_device(backend, x::Array) -> device array
-
-`x` copied to the backend's device. Implemented by the backend extension; the tuner's probe and
-verification problems are built on the host and moved with it.
-"""
-to_device(be::KernelDispatch.KernelBackend, x) = throw(ArgumentError(
-    "no device arrays for $(typeof(be)); load the package for that backend"))
+# What the built-in kernels need from a device backend that is specific to them, as methods on KernelDispatch'
+# backend tags. A backend extension (Metal: `ext/LuxTriangleAttentionMetalExt.jl`) adds them for its own tag. The
+# generic device tools — `to_device`, `device_caps`, `release!`, `device_available` — are KernelDispatch's; everything
+# else — building, launching, verifying, timing, tuning — is backend-agnostic code in `launch.jl` and `tune.jl`.
 
 """
     supported_eltypes() -> Tuple{Vararg{DataType}}

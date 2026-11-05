@@ -283,7 +283,7 @@ how fast they are. A stage with no finite point is an error — there is then no
 """
 function calibrate!(k::BuiltinKernel, ::Type{T}=Float32; dim::Integer, n::Integer,
     force::Bool=false, probe_heads::Integer=4, persist::Bool=true) where {T}
-    device_kernel_available() || throw(ErrorException(
+    KernelDispatch.device_available() || throw(ErrorException(
         "no usable device backend is loaded, so `:$(KernelDispatch.kernelname(k))` cannot be calibrated. " *
         "Load the package for your GPU (e.g. `using Metal`) first."))
     _check_eltype(T)
