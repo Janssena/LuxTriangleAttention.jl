@@ -2,12 +2,14 @@ module LuxTriangleAttention
 
 import KernelDispatch
 import Lux, Random
+import LinearAlgebra
 import Preferences
 
 using KernelAbstractions
 using KernelDispatch: OutArray, call_binary, backend_of
 using KernelDispatch: KernelBackend, CPUBackend, MetalBackendTag, CUDABackendTag, ROCmBackendTag,
     UnknownBackend, GPUBackend, device_dense, traced_autodiff, KERNEL_IN_TRACED_AUTODIFF, realtype
+using KernelDispatch: DeviceCaps, device_caps, to_device, release!
 using Static
 using TOML
 using BFloat16s: BFloat16
