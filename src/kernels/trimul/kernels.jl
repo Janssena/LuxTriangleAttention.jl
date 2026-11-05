@@ -99,7 +99,7 @@ kernel there); each segment re-derives the thread's indices.
         for q in 1:(NT ÷ TB)
             s += @inbounds part[q, tid + 1]
         end
-        @inbounds stat[2, tid + 1] = inv(sqrt(s / Float32(D) + eps))
+        @inbounds stat[2, tid + 1] = inv(Base.sqrt_llvm(s / Float32(D) + eps))
     end
     @synchronize
 
@@ -338,7 +338,7 @@ as the forward does. Besides `dx`, a group writes its partial sums to `part[:, g
         for q in 1:(NT ÷ TB)
             s += @inbounds part1[q, tid + 1]
         end
-        @inbounds stat[2, tid + 1] = inv(sqrt(s / Float32(D) + eps))
+        @inbounds stat[2, tid + 1] = inv(Base.sqrt_llvm(s / Float32(D) + eps))
     end
     @synchronize
 
