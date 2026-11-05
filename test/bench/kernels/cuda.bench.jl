@@ -3,6 +3,10 @@
 #   KERNELDISPATCH_CACHE=$(mktemp -d) julia --project=test test/bench/kernels/cuda.bench.jl 2>&1 | tee lta_cuda_bench.log
 #   LTA_BENCH=hd8 …   only the head-dimension-8 table (the quick one): is a zero-padded `:flash_mma` faster than `:default`?
 #   LTA_BENCH=main …  everything except the head-dimension-8 table
+#   LTA_PIN=<log> …   do not tune `:flash_mma`: run, for every row, the forward / dkv / dq configurations printed in <log> (a
+#                     previous run of this script). Used by `p1_attribution.jl` so that all variants run the SAME configuration.
+#                     Each pinned configuration is checked to fit and dispatch in this build, and the output is checked against
+#                     `:default` (the `err` column).
 #
 # Each cell is the GPU time of one call (CUDA events, mean of `REPS` after a warm-up), through the kernels' KernelDispatch
 # methods directly. The kernels are tuned first (`tune_flash_kernel!`, `tune_flash_mma!`), outside the timed region.
@@ -35,34 +39,84 @@ function problem(T, hd, n)
     return (; q, k, v, dO, bias, mask)
 end
 
+# --- LTA_PIN: configurations of an earlier run, instead of tuning -------------------------------------------------------------
+const TYPE_BY_NAME = Dict("Float32" => Float32, "Float16" => Float16, "BFloat16" => LTA.BFloat16)
+function parse_cfg(s)
+    kv = [split(strip(x), " = ") for x in split(s, ",")]
+    return NamedTuple{Tuple(Symbol(k) for (k, _) in kv)}(Tuple(k == "ops" ? TYPE_BY_NAME[last(split(v, "."))] :      # prints as `Core.BFloat16`
+ parse(Int, v) for (k, v) in kv))
+end
+function read_pins(path)
+    pins = Dict{Tuple{String,Int,Int},Dict{Symbol,NamedTuple}}()
+    for l in eachline(path)
+        m = match(r"^(\w+)\s+(\d+)\s+(\d+) \|.*\| \((.*?)\) dkv=\((.*?)\) dq=\((.*?)\)", l)
+        m === nothing && continue
+        pins[(m[1], parse(Int, m[2]), parse(Int, m[3]))] = Dict(:fwd => parse_cfg(m[4]), :dkv => parse_cfg(m[5]), :dq => parse_cfg(m[6]))
+    end
+    isempty(pins) && error("LTA_PIN=$path: no configuration rows found")
+    return pins
+end
+const PINS = haskey(ENV, "LTA_PIN") ? read_pins(ENV["LTA_PIN"]) : nothing
+
+# What `tune!` does after it has chosen: build every stage at its point for every bias / mask presence and register it.
+function pin_flash_mma!(Tc, hd, n, cfgs)
+    k = LTA.FlashMMA()
+    caps = KD.device_caps(KD.device_backend())
+    for s in LTA.tune_stages(k)
+        LTA.mma_shmem(s, hd, Tc, cfgs[s]) <= caps.max_shmem ||
+            error("pinned $s configuration $(cfgs[s]) needs more shared memory than this build/device has (hd=$hd n=$n)")
+        LTA._admits_all(k, s, Tc, hd, cfgs[s]) || error("pinned $s configuration $(cfgs[s]) is not dispatchable here (hd=$hd n=$n)")
+    end
+    for (hb, hm) in LTA._SPECIALISATIONS
+        bins = [s => LTA.build_stage(k, s, Tc, hd, cfgs[s]; hasbias=hb, hasmask=hm) for s in LTA.tune_stages(k)]
+        KD.add_variant!(LTA.SDPA(), k, LTA._attention_variant_key(k, Tc, hd, n; hasbias=hb, hasmask=hm); bins...)
+    end
+end
+relerr(a, b) = sqrt(sum(abs2, Float32.(a) .- Float32.(b)) / sum(abs2, Float32.(b)))
+
 op = LTA.SDPA()
 kernels = (default=LTA.FlashScalar(), mma=LTA.FlashMMA())
 
 println("device: ", CUDA.name(CUDA.device()), "   H=$H, B=$B, triangle shapes [hd, H, n, n, B], bias and mask present")
 const EXT = Base.get_extension(LTA, :LuxTriangleAttentionCUDAExt)
+println(PINS === nothing ? "configurations: tuned" : "configurations: pinned from $(ENV["LTA_PIN"])")
 println("shared-memory path: smem_pad=", EXT.SMEM_PAD, " ldmatrix=", EXT.LDMATRIX, " stage_bias=", EXT.STAGE_BIAS)
-@printf("%-9s %4s %4s | %10s %10s %7s | %10s %10s %7s | %s\n", "type", "hd", "n", "fwd dflt", "fwd mma", "x", "bwd dflt", "bwd mma", "x", "mma config (fwd) [dkv] [dq]")
+flush(stdout)
+@printf("%-9s %4s %4s | %10s %10s %7s | %10s %10s %7s | %s\n", "type", "hd", "n", "fwd dflt", "fwd mma", "x", "bwd dflt", "bwd mma", "x", "mma config (fwd) [dkv] [dq]  [pinned: relL2 vs :default]")
 for T in TYPES, hd in HEADDIMS, n in LENGTHS
     get(ENV, "LTA_BENCH", "all") == "hd8" && break         # LTA_BENCH=hd8: only the head-dimension-8 table below
     c = problem(T, hd, n)
     LTA.tune_flash_kernel!(n; dim=hd, T)
-    LTA.tune_flash_mma!(n; dim=hd, T)
+    if PINS === nothing
+        LTA.tune_flash_mma!(n; dim=hd, T)
+    else
+        pin_flash_mma!(LTA.mma_compute_type(LTA.mma_backend(), T), hd, n, PINS[(String(nameof(T)), hd, n)])
+    end
     row = Dict{Symbol,Tuple{Float64,Float64}}()
+    outs = Dict{Symbol,Any}()
     for (name, kern) in pairs(kernels)
         fwd() = KD.forward(op, kern, c.q, c.k, c.v, c.mask, c.bias)
         o, lse = fwd()
+        outs[name] = o
         bwd() = KD.backward(op, kern, (c.q, c.k, c.v, c.mask, c.bias), (o, lse), (c.dO, nothing))
         row[name] = (gputime(fwd), gputime(bwd))
     end
     cfg = try
-        c3 = LTA.flash_mma_config(LTA.mma_compute_type(LTA.mma_backend(), T), hd, n)
+        c3 = PINS === nothing ? LTA.flash_mma_config(LTA.mma_compute_type(LTA.mma_backend(), T), hd, n) :
+             PINS[(String(nameof(T)), hd, n)]
         "$(c3[:fwd]) dkv=$(c3[:dkv]) dq=$(c3[:dq])"
     catch
         "runs :default"
     end
+    if PINS !== nothing
+        e = relerr(outs[:mma], outs[:default])
+        e < 2e-2 || error("pinned :flash_mma output differs from :default (relL2 = $e) at $T hd=$hd n=$n")
+        cfg *= @sprintf("  relL2=%.1e", e)
+    end
     @printf("%-9s %4d %4d | %9.3f  %9.3f  %6.2fx | %9.3f  %9.3f  %6.2fx | %s\n", nameof(T), hd, n,
         row[:default][1], row[:mma][1], row[:default][1] / row[:mma][1],
         row[:default][2], row[:mma][2], row[:default][2] / row[:mma][2], cfg)
+    flush(stdout)                                          # rows reach a redirected log as they finish
 end
 
 # --- head dimension 8 (the AlphaFold size): would padding it to 16 pay off? -------------------------------------------------
@@ -93,4 +147,5 @@ for T in TYPES, n in LENGTHS
     @printf("%-9s %4d | %9.3f  %9.3f  %9.3f  %6.2fx | %9.3f  %9.3f  %9.3f  %6.2fx\n", nameof(T), n,
         t[:d8][1], t[:d16][1], t[:m16][1], t[:d8][1] / t[:m16][1],
         t[:d8][2], t[:d16][2], t[:m16][2], t[:d8][2] / t[:m16][2])
+    flush(stdout)
 end

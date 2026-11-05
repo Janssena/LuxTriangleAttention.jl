@@ -2,6 +2,13 @@
 #
 #     julia --project=test test/bench/kernels/p1_attribution.jl                  # every variant
 #     julia --project=test test/bench/kernels/p1_attribution.jl base all         # just these
+#     LTA_PIN=lta_p1_all.log julia --project=test test/bench/kernels/p1_attribution.jl     # same configurations in every variant
+#
+# With `LTA_PIN=<log>` the tuner is not run: every variant runs the forward / dkv / dq configurations printed in <log> (an
+# earlier run of `cuda.bench.jl`, e.g. the `all` log of an unpinned run), so a difference between variants is the kernel's, not the
+# tuner's. Pin to the `all` log: that build uses the most shared memory, so its configurations fit every other variant. The pinned
+# configurations were chosen for that build, which favours it a little: compare `base`, `pad`... with each other first. No tuning
+# also makes a variant much faster. Pinned logs are `lta_p1_<variant>_pinned.log`.
 #
 # Each variant sets the three CUDA switches of `ext/LuxTriangleAttentionCUDAExt/flash_mma.jl` through the package's
 # preferences (`test/LocalPreferences.toml`, removed again at the end), and runs `cuda.bench.jl` (LTA_BENCH=main) in a fresh
@@ -30,6 +37,10 @@ const VARIANTS = [
 const PROJECT = abspath(joinpath(@__DIR__, "..", ".."))                 # test/
 const BENCH = joinpath(@__DIR__, "cuda.bench.jl")
 
+const PIN = get(ENV, "LTA_PIN", nothing)
+PIN === nothing || isfile(PIN) || error("LTA_PIN=$PIN: no such file")
+const SUFFIX = PIN === nothing ? "" : "_pinned"
+
 wanted = isempty(ARGS) ? first.(VARIANTS) : ARGS
 unknown = setdiff(wanted, first.(VARIANTS))
 isempty(unknown) || error("unknown variant(s) $(unknown); known: $(first.(VARIANTS))")
@@ -54,10 +65,12 @@ try
     for (name, v) in VARIANTS
         name in wanted || continue
         setswitches(v)
-        log = abspath("lta_p1_$name.log")
+        log = abspath("lta_p1_$name$SUFFIX.log")
         cache = mktempdir()
         println("== $name: smem_pad=$(v.pad) ldmatrix=$(v.ldm) stage_bias=$(v.stage)  ->  $log")
-        cmd = addenv(`$(Base.julia_cmd()) --project=$PROJECT $BENCH`, "KERNELDISPATCH_CACHE" => cache, "LTA_BENCH" => "main")
+        env = ["KERNELDISPATCH_CACHE" => cache, "LTA_BENCH" => "main"]
+        PIN === nothing || push!(env, "LTA_PIN" => abspath(PIN))
+        cmd = addenv(`$(Base.julia_cmd()) --project=$PROJECT $BENCH`, env...)
         open(log, "w") do io                                   # one handle: two would overwrite each other
             run(pipeline(cmd; stdout=io, stderr=io))
         end
