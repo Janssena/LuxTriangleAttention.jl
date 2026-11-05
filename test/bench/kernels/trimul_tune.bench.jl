@@ -51,7 +51,7 @@ function main()
     try
         LTA.set_trimul_tunables!()
         emit("default", "-", timeit(fwd), timeit(bwd))
-        for (param, values) in (:nb => (4096, 8192, 16384, 32768, 65536, 131072), :NTE => (128, 256, 512, 1024),
+        for (param, values) in (:nb => (4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288), :NTE => (128, 256, 512, 1024),
             :NT => (128, 256, 512), :TB => (8, 16, 32))
             for v in values
                 getproperty(base, param) == v && continue
