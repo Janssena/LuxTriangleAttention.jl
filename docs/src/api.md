@@ -66,7 +66,6 @@ SDPA
 use_kernel!
 current_kernel
 list_kernels
-device_kernel_available
 ```
 
 ## Tuning
