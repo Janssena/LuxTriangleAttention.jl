@@ -63,13 +63,18 @@ LTA.mma_compute_type(::CUDABackendTag, ::Type{T}) where {T} =
     return AFrag{E}((a0, a1, a2, a3))
 end
 
-# The knobs of the shared-memory path, each reproducing the plain kernel when switched off (measure one at a time, see
-# docs/cuda_kernel_speed_improvements.md): `SMEM_PAD` entries added to the leading dimension of every `B`-operand array, so
-# the eight lanes `g` of a fragment load fall in different banks; `LDMATRIX` loads a `B` fragment with one `ldmatrix`;
-# `STAGE_BIAS` stages the forward's bias tile in local memory. Changing one needs the package to be recompiled.
-const SMEM_PAD = 8
-const LDMATRIX = true
-const STAGE_BIAS = true
+# The knobs of the shared-memory path, each reproducing the plain kernel when switched off: `SMEM_PAD` entries added to the
+# leading dimension of every `B`-operand array, so the eight lanes `g` of a fragment load fall in different banks (0 = off);
+# `LDMATRIX` loads a `B` fragment with one `ldmatrix` instead of four 16-bit loads; `STAGE_BIAS` stages the forward's bias tile
+# in local memory. They are compile-time constants read from the package's preferences (a change recompiles the extension, and
+# `KERNELDISPATCH_CACHE` must be fresh: a cached binary does not know them). `test/bench/kernels/p1_attribution.jl` sets them to
+# measure each one's share, see docs/cuda_kernel_speed_improvements.md ("Phase 1").
+#
+#     using Preferences, LuxTriangleAttention
+#     set_preferences!(LuxTriangleAttention, "cuda_smem_pad" => 0, "cuda_ldmatrix" => false, "cuda_stage_bias" => false)
+const SMEM_PAD = LTA.Preferences.load_preference(LTA, "cuda_smem_pad", 8)::Int
+const LDMATRIX = LTA.Preferences.load_preference(LTA, "cuda_ldmatrix", true)::Bool
+const STAGE_BIAS = LTA.Preferences.load_preference(LTA, "cuda_stage_bias", true)::Bool
 
 # A column starts 16-byte aligned (what `ldmatrix` needs) when the leading dimension is a multiple of 8 entries, and the 8
 # columns of a block then spread over all banks when it is 8 mod 16 (`n + 8` for the head dimensions and tiles used here).
