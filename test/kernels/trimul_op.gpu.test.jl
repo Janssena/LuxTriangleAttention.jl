@@ -53,10 +53,16 @@ if GPU !== nothing
                 @test check_case(32, 16, 21, 2; fused, fused_glu, layer_norm_bias, use_bias=true)
             end
         end
-        # T = 130²·1 = 16900 tokens: two blocks of the default 16384, the second a tail of 516.
+        # T = 130²·1 = 16900 tokens: with the block pinned to nb = 4096 (a backend's tuned `nb` can exceed T), four full
+        # blocks and a tail of 516.
         @testset "several blocks with a tail" begin
-            @test LTAg.trimul_tunables(backend_tag()).nb < 130^2
-            @test check_case(16, 8, 130, 1; is_outgoing=false)
+            LTAg.set_trimul_tunables!(; nb=4096)
+            try
+                @test LTAg._trimul_tunables(backend_tag()).nb < 130^2
+                @test check_case(16, 8, 130, 1; is_outgoing=false)
+            finally
+                LTAg.set_trimul_tunables!()
+            end
         end
         # C = 256: a [257, 32] Float32 tile and its reduction buffers take 33 KiB, more than Metal's 32 KiB of
         # threadgroup memory, so there the tile shrinks (CUDA's 48 KiB of static shared memory holds it).
