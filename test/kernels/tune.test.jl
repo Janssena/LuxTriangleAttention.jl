@@ -6,7 +6,7 @@ using Test, Random, LuxTriangleAttention
 const LTAt = LuxTriangleAttention
 
 @testset "tuning skeleton" begin
-    caps = LTAt.DeviceCaps(32, 1024, 32768, "mock-device")
+    caps = LTAt.KernelDispatch.DeviceCaps(32, 1024, 32768, "mock-device")
     KA, MMA = LTAt.FlashScalar(), LTAt.FlashMMA()
 
     @testset "grids: only what each kernel tunes" begin
@@ -20,7 +20,7 @@ const LTAt = LuxTriangleAttention
             stage === :fwd && @test all(p -> p.kt % p.sb == 0, pts)
         end
         # A narrower storage type legalises larger tiles (the staged tiles are in storage precision).
-        small = LTAt.DeviceCaps(32, 1024, 16384, "small")
+        small = LTAt.KernelDispatch.DeviceCaps(32, 1024, 16384, "small")
         @test maximum(p.kt for p in LTAt.grid_points(KA, :fwd, 64, Float16, small)) >
               maximum(p.kt for p in LTAt.grid_points(KA, :fwd, 64, Float32, small))
         @test_throws ArgumentError LTAt.grid_points(KA, :nonsense, 32, Float32, caps)
@@ -44,7 +44,7 @@ const LTAt = LuxTriangleAttention
         @test LTAt.mma_compute_type(KernelDispatch.CPUBackend(), Float32) === Float32     # a device runs T as it is by default
         @test LTAt._mma_shape(LTAt.mma_backend()) isa NTuple{3,Int}
         # The device's thread cap filters before anything is compiled.
-        tiny = LTAt.DeviceCaps(32, 128, 32768, "tiny")
+        tiny = LTAt.KernelDispatch.DeviceCaps(32, 128, 32768, "tiny")
         @test all(p -> LTAt.mma_threads(p) <= 128, LTAt.grid_points(MMA, :fwd, 32, Float32, tiny))
     end
 

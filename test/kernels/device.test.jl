@@ -1,6 +1,6 @@
-# The backend hooks in `src/kernels/device.jl`, with NO backend extension loaded.
+# What this package does with NO backend extension loaded. (The generic device tools — `to_device`, `device_caps`,
+# `release!` — are KernelDispatch's, with their own no-device tests there.)
 #
-# Each hook is a method on KernelDispatch' backend tags that a backend extension adds for its own tag.
 # Run before `using Metal` appears anywhere in the suite (it is the first unit of `test/kernels/runtests.jl`, and a
 # `cpu` or `device` run never loads a backend at all), so what is under test is genuinely the UNINSTALLED default — an error that
 # names what to load, not a stub that happens to have nothing to report. `test/ext/metal/`
@@ -8,17 +8,14 @@
 
 @testset "device hooks, no backend loaded" begin
     L = LuxTriangleAttention
-    @test L.device_kernel_available() == false
-    tag = L.KernelDispatch.MetalBackendTag()
-    @test_throws ArgumentError L.device_caps(tag)
-    @test_throws ArgumentError L.to_device(tag, zeros(Float32, 2))
+    @test L.KernelDispatch.device_available() == false
 
     # Building needs the one loaded device backend: none, so KernelDispatch refuses.
     for stage in L.FLASH_STAGES
         @test_throws ArgumentError L.build_stage(L.FlashScalar(), stage, Float32, 32, (; tg=128, kt=64, sb=1))
     end
 
-    # Calibrating and tuning check `device_kernel_available()` first: this package's own message.
+    # Calibrating and tuning check `KernelDispatch.device_available()` first: this package's own message.
     @test_throws ErrorException L.calibrate!(Float32; dim=32)
     @test_throws ErrorException L.calibrate_mma!(Float32; dim=32)
     @test_throws ErrorException L.tune_flash_kernel!(64; dim=32)

@@ -26,6 +26,7 @@ end
 selected("ext_cuda"; backend=:gpu) && gpu_backend() === :cuda && @testset verbose = VERBOSE "CUDA" begin
     include("cuda/device.test.jl")            # ext/LuxTriangleAttentionCUDAExt.jl
     include("cuda/flash_mma.test.jl")         # ext/LuxTriangleAttentionCUDAExt/flash_mma.jl
+    include("cuda/trimul_enzyme.test.jl")     # TriMul's backward through KernelDispatch' Enzyme rule, end to end
 end
 
 selected("ext_reactant"; backend=:reactant) && @testset verbose = VERBOSE "Reactant" begin
@@ -36,6 +37,7 @@ selected("ext_reactant"; backend=:reactant) && @testset verbose = VERBOSE "React
         @testset "TriangleAttention, 16-bit" begin include("reactant/triangle_attention.test.jl") end
         @testset "StableLayerNorm" begin include("reactant/primitives.test.jl") end
         @testset "TriMulCore" begin include("reactant/tri_mul_core.test.jl") end             # Folded and HalfSafe
+        @testset "TriangleMultiplication(use_kernel=true)" begin include("reactant/trimul_kernel.test.jl") end   # traces the layer
     end
 end
 

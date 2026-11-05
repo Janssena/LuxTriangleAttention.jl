@@ -1,4 +1,5 @@
-# ext/LuxTriangleAttentionCUDAExt.jl: the three device hooks the built-in kernels need from a backend.
+# ext/LuxTriangleAttentionCUDAExt.jl: the device hook the built-in kernels need from CUDA. (`to_device`,
+# `device_caps` and `release!` are KernelDispatch's now, and tested there.)
 
 using KernelAbstractions
 import KernelDispatch
@@ -10,24 +11,6 @@ import LuxTriangleAttention as LTA
 end
 
 @testset "device hooks" begin
-    be = backend_tag()
-
-    @testset "to_device" begin
-        x = rand(Float32, 3, 4)
-        d = LTA.to_device(be, x)
-        @test d isa DeviceArray
-        @test Array(d) == x
-    end
-
-    @testset "device_caps" begin
-        caps = LTA.device_caps(be)
-        @test caps isa LTA.DeviceCaps
-        @test caps.warp == 32
-        @test caps.max_threads >= 32
-        @test 0 < caps.max_shmem <= 48 * 1024            # KernelAbstractions' @localmem is static shared memory
-        @test occursin(r"sm_\d+", caps.name)             # the calibration key says which architecture it is
-    end
-
     # The `dbias` atomic, as a kernel uses it: every thread of every group adds to one element of a raw pointer.
     @testset "_atomic_fadd!" begin
         bin = KernelDispatch.ka_compile(KernelDispatch.device_backend(), add_to_first!,

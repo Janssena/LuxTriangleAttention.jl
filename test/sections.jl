@@ -23,7 +23,7 @@
 # `LTA_TEST_GPU=none|metal|cuda` overrides the GPU backend choice.
 
 const COMPONENT_GROUPS = [
-    "kernels" => ["device", "sdpa_op", "stage_args", "verify", "launch", "tune", "flash", "flash_mma"],
+    "kernels" => ["device", "sdpa_op", "trimul_op", "stage_args", "verify", "launch", "tune", "flash", "flash_mma"],
     "layers" => ["attention", "triangle_attention", "triangle_multiplication", "tri_mul_core", "glu",
         "channels_last", "primitives", "chunk"],
     "ext" => ["ext_metal", "ext_cuda", "ext_reactant"],

@@ -26,6 +26,14 @@ selected("sdpa_op"; backend=:gpu) && @testset verbose = VERBOSE "sdpa_op, on the
     include("sdpa_op.gpu.test.jl")
 end
 
+selected("trimul_op"; backend=:cpu) && @testset verbose = VERBOSE "trimul_op" begin
+    include("trimul_op.test.jl")
+end
+
+selected("trimul_op"; backend=:gpu) && @testset verbose = VERBOSE "trimul_op, on the GPU" begin
+    include("trimul_op.gpu.test.jl")
+end
+
 selected("verify") && @testset verbose = VERBOSE "verify" begin
     include("verify.test.jl")
 end
