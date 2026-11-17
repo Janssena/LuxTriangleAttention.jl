@@ -27,7 +27,7 @@ const OUT = length(ARGS) >= 1 ? ARGS[1] : nothing
 const N = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 384
 const C = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 128
 const H = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 128
-const REPS = 7
+const REPS = 15
 
 function main()
     kern = TriangleMultiplication(C, H; use_kernel=true)
@@ -50,6 +50,12 @@ function main()
     emit(param, value, f, b) = (r = @sprintf("%s,%s,%.2f,%.2f", param, value, f, b); println(r); push!(rows, r))
     try
         LTA.set_trimul_tunables!()
+        # Warm up for a few seconds first (clocks, the allocator's pool): on an A40 the first rows of an earlier sweep read 20-40%
+        # slower than the identical configuration measured later.
+        t0 = time()
+        while time() - t0 < 5
+            fwd(); bwd()
+        end
         emit("default", "-", timeit(fwd), timeit(bwd))
         for (param, values) in (:nb => (4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288), :NTE => (128, 256, 512, 1024),
             :NT => (128, 256, 512), :TB => (8, 16, 32))
@@ -64,6 +70,8 @@ function main()
                 emit(param, v, f...)
             end
         end
+        LTA.set_trimul_tunables!()
+        emit("default_again", "-", timeit(fwd), timeit(bwd))   # must match the first row; if not, the sweep drifted
     finally
         LTA.set_trimul_tunables!()
     end
