@@ -96,9 +96,9 @@ for T in TYPES, hd in HEADDIMS, n in LENGTHS
     outs = Dict{Symbol,Any}()
     for (name, kern) in pairs(kernels)
         fwd() = KD.forward(op, kern, c.q, c.k, c.v, c.mask, c.bias)
-        o, lse = fwd()
-        outs[name] = o
-        bwd() = KD.backward(op, kern, (c.q, c.k, c.v, c.mask, c.bias), (o, lse), (c.dO, nothing))
+        res = fwd()                                        # (o, lse), or (o, lse, e) with the `output_residual` preference
+        outs[name] = res[1]
+        bwd() = KD.backward(op, kern, (c.q, c.k, c.v, c.mask, c.bias), res, (c.dO, nothing))
         row[name] = (gputime(fwd), gputime(bwd))
     end
     cfg = try
@@ -140,8 +140,8 @@ for T in TYPES, n in LENGTHS
     t = Dict{Symbol,Tuple{Float64,Float64}}()
     for (label, c, kern) in ((:d8, c8, kernels.default), (:d16, c16, kernels.default), (:m16, c16, kernels.mma))
         fwd() = KD.forward(op, kern, c.q, c.k, c.v, c.mask, c.bias)
-        o, lse = fwd()
-        bwd() = KD.backward(op, kern, (c.q, c.k, c.v, c.mask, c.bias), (o, lse), (c.dO, nothing))
+        res = fwd()
+        bwd() = KD.backward(op, kern, (c.q, c.k, c.v, c.mask, c.bias), res, (c.dO, nothing))
         t[label] = (gputime(fwd), gputime(bwd))
     end
     @printf("%-9s %4d | %9.3f  %9.3f  %9.3f  %6.2fx | %9.3f  %9.3f  %9.3f  %6.2fx\n", nameof(T), n,

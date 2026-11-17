@@ -73,8 +73,8 @@ for T in TYPES, (hd, H, n) in SHAPES, setting in ("plain", "bias+mask")
             bt === nothing ? nothing : Float64.(bt), mask)
         d(x) = x === nothing ? nothing : DEV(x)
         op, kern = LTA.SDPA(), LTA.FlashMMA()
-        o, lse = KD.forward(op, kern, d(qt), d(kt), d(vt), d(mask), d(bt))
-        g = KD.backward(op, kern, (d(qt), d(kt), d(vt), d(mask), d(bt)), (o, lse), (d(dOt), nothing))
+        fwd = KD.forward(op, kern, d(qt), d(kt), d(vt), d(mask), d(bt))      # (o, lse), plus the output residual when `output_residual` is on
+        g = KD.backward(op, kern, (d(qt), d(kt), d(vt), d(mask), d(bt)), fwd, (d(dOt), nothing))
         got = (; dq=g[1], dk=g[2], dv=g[3], dbias=g[5])
         for name in (:dq, :dk, :dv, :dbias)
             r = getproperty(ref, name)
@@ -91,9 +91,10 @@ for T in TYPES, (hd, H, n) in SHAPES, setting in ("plain", "bias+mask")
     end
 end
 
+# LTA_ACC_NOCSV=1: print only (an A/B of two builds that should not both land in the file)
 new = !isfile(CSV)
-open(CSV, "a") do io
+isempty(get(ENV, "LTA_ACC_NOCSV", "")) && open(CSV, "a") do io
     new && println(io, "when,device,type,hd,H,n,setting,grad,rmse,floor,ratio")
     foreach(r -> println(io, r), rows)
 end
-println("\nappended $(length(rows)) rows to $CSV")
+isempty(get(ENV, "LTA_ACC_NOCSV", "")) && println("\nappended $(length(rows)) rows to $CSV")
