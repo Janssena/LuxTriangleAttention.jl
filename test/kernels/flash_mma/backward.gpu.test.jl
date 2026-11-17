@@ -53,3 +53,27 @@ end
             @info "dbias repeatability ($T): $distinct distinct result(s) in $REPEATS runs"
     end
 end
+
+# The output residual (`output_residual` preference): the forward returns `(o, lse, e)` for a type the device computes in (not Float32
+# storage on Metal), `e = T(O32 − o)` is what the rounding of `o` dropped, so it is bounded by half an ulp of `o`, and a backward that
+# uses `o + e` for δ is no less accurate than one that does not. With the preference off, the forward returns the pair.
+@testset "output residual, $T" for T in MMA_ALL_TYPES
+    shape = (32, 2, 96, 96, 1)
+    Tc = LTA_.mma_compute_type(LTA_.mma_backend(), T)
+    c = mma_case(T, shape, true, true)
+    out = mma_forward(c, T, shape)
+    @test length(out) == (LTA_._mma_resid(Tc) ? 3 : 2)
+    if LTA_._mma_resid(Tc)
+        o, lse, e = out
+        @test size(e) == size(o)
+        p = Tc === Float16 ? 11 : 8                            # significand bits
+        ao, ae = abs.(Float64.(Array(o))), abs.(Float64.(Array(e)))
+        @test all(ae .<= ao .* 2.0^-(p - 1) .+ Float64(floatmin(Tc)))     # |e| ≤ half an ulp of o (with slack)
+        @test count(>(0), ae) > length(ae) ÷ 4                 # and it is not all zero
+        ref = mma_reference_grads(c)
+        err(g) = maximum(relL2_mma(Array(a), r) for (a, r) in zip(g[1:3], ref[1:3]))
+        with = mma_backward(c, o, lse, e)
+        without = mma_backward(c, o, lse)
+        @test err(with) <= 1.1 * err(without)
+    end
+end

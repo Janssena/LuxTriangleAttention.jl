@@ -6,8 +6,8 @@
 using Test, LuxTriangleAttention
 const LTAsa = LuxTriangleAttention
 
-const ROLES = NamedTuple{(:o, :lse, :q, :k, :v, :bias, :bias_t, :mask, :dO, :delta, :dq, :dk, :dv,
-    :dbias, :dbias_t)}((:o, :lse, :q, :k, :v, :bias, :bias_t, :mask, :dO, :delta, :dq, :dk, :dv,
+const ROLES = NamedTuple{(:o, :lse, :e, :q, :k, :v, :bias, :bias_t, :mask, :dO, :delta, :dq, :dk, :dv,
+    :dbias, :dbias_t)}((:o, :lse, :e, :q, :k, :v, :bias, :bias_t, :mask, :dO, :delta, :dq, :dk, :dv,
     :dbias, :dbias_t))
 const SCALARS = (:scale, :n, :nouter, :nh, :mheads)
 
@@ -21,7 +21,7 @@ const WANT = Dict(
     (LTAsa.FlashScalar(), :dq) => (:dq, :dbias_t, :q, :k, :v, :bias_t, :mask, :dO, :lse, :delta, SCALARS...),
     (LTAsa.FlashScalar(), :dk) => (:dk, :q, :k, :v, :bias, :mask, :dO, :lse, :delta, SCALARS...),
     (LTAsa.FlashScalar(), :dv) => (:dv, :q, :k, :bias, :mask, :dO, :lse, SCALARS...),
-    (LTAsa.FlashMMA(), :fwd) => (:o, :lse, :q, :k, :v, :bias, :mask, SCALARS...),
+    (LTAsa.FlashMMA(), :fwd) => (:o, :lse, :e, :q, :k, :v, :bias, :mask, SCALARS...),
     (LTAsa.FlashMMA(), :dkv) => (:dk, :dv, :dbias, :q, :k, :v, :bias, :mask, :dO, :lse, :delta, SCALARS...),
     (LTAsa.FlashMMA(), :dq) => (:dq, :q, :k, :v, :bias, :mask, :dO, :lse, :delta, SCALARS...),
 )

@@ -51,7 +51,7 @@ const MMA = () -> (LTA_.SDPA(), LTA_.FlashMMA())
 # Whether `dbias` is bitwise repeatable. Today it is accumulated with float atomics (`_atomic_fadd!` in `:dkv`), so its sum
 # order follows the scheduler. `backward.gpu.test.jl` always requires `dq`/`dk`/`dv` to repeat bit for bit, and `dbias` too
 # once this is `true` (docs/cuda_kernel_speed_improvements.md, improvement 10); until then it only reports what it saw.
-const DBIAS_DETERMINISTIC = false
+const DBIAS_DETERMINISTIC = LuxTriangleAttention.DET_DBIAS    # the `deterministic_dbias` preference
 
 # `:flash_mma`'s forward and backward on one case, at the case's own storage type.
 function mma_forward(c, T, shape)
@@ -64,10 +64,10 @@ function mma_forward(c, T, shape)
     return KernelDispatch.forward(op, kern, c.d(c.q), c.d(c.k), c.d(c.v), c.d(c.mask), c.d(c.bias))
 end
 
-function mma_backward(c, o, lse)
+function mma_backward(c, o, lse, e...)            # `e`: the forward's output residual, when it wrote one
     op, kern = MMA()
     g = KernelDispatch.backward(op, kern, (c.d(c.q), c.d(c.k), c.d(c.v), c.d(c.mask), c.d(c.bias)),
-        (o, lse), (c.d(c.dO), nothing))
+        (o, lse, e...), (c.d(c.dO), nothing))
     return g[1], g[2], g[3], g[5]                       # dq, dk, dv, dbias
 end
 

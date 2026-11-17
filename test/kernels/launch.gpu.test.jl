@@ -265,6 +265,7 @@ if GPU !== nothing
             _, _, _, m, b, d = LTA._sdpa_prep(q16, k16, v16, nothing, bias, true)
             q32, k32, v32 = (Float32.(x) for x in (q16, k16, v16))
             a = (; o=KernelDispatch.OutArray(Float32, LTA._full(d)), lse=KernelDispatch.OutArray(Float32, LTA._res(d)),
+                e=KernelDispatch.OutArray(Float32, (1,)),            # the output residual: a single unused element when off
                 q=q32, k=k32, v=v32, bias=Float32.(b), bias_t=Float32.(LTA._pair_t(b, d)), mask=m)
             args = LTA.stage_args(kern, Val(:fwd), a, LTA._scalars(d))
             b16 = KernelDispatch.variants(op, kern)[LTA._key(d)][:fwd]
