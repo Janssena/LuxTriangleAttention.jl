@@ -1,5 +1,5 @@
 # `TriangleMultiplication(use_kernel=true)` UNDER `Reactant.@compile`: the staged kernel is an eager pipeline (its block loops write
-# workspaces in place, which jax-mps cannot trace, and the traced layer is the faster program anyway; see docs/FEATURE_trimul_kernel.md),
+# workspaces in place, which jax-mps cannot trace, and the traced layer is the faster program anyway; see docs/done/FEATURE_trimul_kernel.md),
 # so a trace must compile the layer's own forward, to the same numbers as `use_kernel=false` and with no kernel in the IR.
 
 using Reactant
