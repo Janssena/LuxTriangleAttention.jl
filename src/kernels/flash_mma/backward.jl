@@ -2,9 +2,30 @@
 # Backward, dK / dV / dbias: rows are KEYS
 # ---------------------------------------------------------------------------------------------
 
+# --- deterministic dbias ----------------------------------------------------------------------------------------
+#
+# `dbias[bh, q, key]` sums `dS` over the OUTER axis, which the grid parallelises: every slice's group adds into the same
+# address. With float atomics the order is the scheduler's, so two runs of one call differ in the last bits. With
+# `deterministic_dbias` (package preference, default `false`; a change recompiles the package) every slice instead STORES
+# its `dS` into a partial of its own, `partial[key, q, i, bh]` (one writer per address, no atomics, the buffer zeroed by the
+# caller so that dead keys read 0), and the op sums the partials over `i` with an ordinary reduction, whose order is
+# fixed. The price is the partial buffer, `Nq·Nq·Nouter·H·B` Float32 (cubic in `n` for a triangle): `_mma_dbias_partials`
+# bounds it. `deterministic_dbias` is part of the kernel's source tag, so a binary built for the other mode is never reused.
+const DET_DBIAS = Preferences.@load_preference("deterministic_dbias", false)::Bool
+_mma_det_dbias(be) = DET_DBIAS
+
+# Where this group's `dbias` rows start: the atomic layout `[key, q, bh]` or the partial one `[key, q, i, bh]`, where
+# `rest = bh·nouter + i` is the group's slice number (`bh` and `i` together).
+@inline _mma_dbias_row(be, bh, rest, n) = _mma_det_dbias(be) ? rest * n * n : bh * n * n
+# One score gradient into `dbias`: a plain store of the slice's own partial, or the atomic add.
+@inline function _mma_dbias_add!(be, dbias, idx, v)
+    _mma_det_dbias(be) ? unsafe_store!(dbias, v, idx) : _atomic_fadd!(dbias, idx, v)
+    return nothing
+end
+
 # One query tile for the R key fragments of this simdgroup. The scores are formed as `Sᵀ = K·Qᵀ` in blocks of `FN`
 # queries; `FK÷FN` blocks make one chunk, the contraction axis of `dV += Pᵀ·dO` and `dK += dSᵀ·Q`.
-@generated function _mma_kv_tile(be, dK, dV, Kf, Vf, qT, qN, dT, dN, ls, dl, bias, dbias, live,
+@generated function _mma_kv_tile(be, dK, dV, Kf, Vf, qT, qN, dT, dN, ls, dl, bias, dbias, dbrow, live, sc,
     keys, bh, n, t, col, ::Val{SH}, ::Val{R}, ::Val{DIM}, ::Val{BQ}, ::Val{HB}) where {SH,R,DIM,BQ,HB}
     FM, FN, FK = SH
     NR, NKD, NQK, NDN, NB = FM ÷ 8, DIM ÷ FK, BQ ÷ FK, DIM ÷ FN, FK ÷ FN
@@ -40,6 +61,8 @@
                     u = NR * (r - 1) + s
                     push!(body, quote
                         s1, s2 = _mma_pair(be, sacc, $s)
+                        s1 *= sc                           # `SCALE_IN_SCORES` (forward.jl); else `sc == 1`
+                        s2 *= sc
                         dp1, dp2 = _mma_pair(be, pacc, $s)
                         c = Int32($(FN * qb)) + col        # query (within the tile) of s1
                         key = keys + Int32($(8 * (u - 1)))
@@ -59,9 +82,9 @@
                         ds2 = lv ? p2 * (dp2 - @inbounds(dl[c+Int32(2)])) : 0f0
                         if HB && lv
                             t + c < n &&
-                                _atomic_fadd!(dbias, (bh * n + t + c) * n + key + Int32(1), ds1)
+                                _mma_dbias_add!(be, dbias, dbrow + (t + c) * n + key + Int32(1), ds1)
                             t + c + Int32(1) < n &&
-                                _atomic_fadd!(dbias, (bh * n + t + c + Int32(1)) * n + key + Int32(1), ds2)
+                                _mma_dbias_add!(be, dbias, dbrow + (t + c + Int32(1)) * n + key + Int32(1), ds2)
                         end
                         $(P1(u, j)), $(P2(u, j)) = p1, p2
                         $(D1(u, j)), $(D2(u, j)) = ds1, ds2
@@ -101,7 +124,8 @@ end
 The `dK`/`dV`/`dbias` stage of `:flash_mma`. Rows are KEYS: each simdgroup holds `R` fragments of `FM`
 keys' `K` and `V` operands and walks the queries in tiles of `BQ`, forming `Sᵀ = K·Qᵀ` and
 `dPᵀ = V·dOᵀ`, then `dV += Pᵀ·dO` and `dK += dSᵀ·Q`. `dbias` (`Float32`, keys-fastest, ZEROED by the
-caller) is accumulated with atomics, because the bias has no outer axis. `lse` and `delta` are the
+caller) is accumulated with atomics, because the bias has no outer axis, or, with `deterministic_dbias`, stored
+per outer slice (`[key, q, i, bh]`, see `DET_DBIAS`). `lse` and `delta` are the
 forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `lse`.
 """
 @kernel unsafe_indices = true function flash_mma_bwd_kv!(dk, dv, dbias, q, k, v, bias, mask, dO,
@@ -141,6 +165,7 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
     fr, col = _mma_lane(be, lane)
     keys = k0 + r0 + fr
     lrow = ((bi * nouter + i) * nh + hi) * n
+    dbrow = _mma_dbias_row(be, bh, rest, n)
 
     # A FULLY MASKED slice (`flash_mma_fwd!` wrote `lse = -Inf` for every query of it) attended uniformly, so
     # `dV[key] = Σⱼ dO[j] / n` for EVERY key < n, and `dK` is zero (the logits were replaced, `dbias` untouched).
@@ -217,7 +242,7 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
             while e < Int32(BQ * DIM)
                 d = e % Int32(DIM); c = e ÷ Int32(DIM); j = t + c
                 off = base + j * step + d + Int32(1)
-                xq = j < n ? Float32(unsafe_load(q, off)) * scale * _LOG2E : 0f0
+                xq = j < n ? Float32(unsafe_load(q, off)) * _mma_qscale(scale) : 0f0
                 xd = j < n ? Float32(unsafe_load(dO, off)) : 0f0
                 @inbounds qT[d+Int32(1), c+Int32(1)] = T(xq)
                 @inbounds qN[c+Int32(1), d+Int32(1)] = PE(xq)
@@ -233,12 +258,12 @@ forward's residual and `Σ o·dO`, both `Float32`, laid out as `flash_fwd!`'s `l
                 e += NT
             end
             @synchronize
-            dK, dV = _mma_kv_tile(be, dK, dV, Kf, Vf, qT, qN, dT, dN, ls, dl, bias, dbias, live, keys,
+            dK, dV = _mma_kv_tile(be, dK, dV, Kf, Vf, qT, qN, dT, dN, ls, dl, bias, dbias, dbrow, live, _mma_score_scale(scale), keys,
                 bh, n, t, col, Val(shp), Val(R), Val(DIM), Val(BQ), Val(HB))
             t += Int32(BQ)
         end
-        # qN held q·scale·log2e, so dK = scale·Σ dS·q is the accumulator over log2e.
-        _mma_store_rows!(be, dk, dK, inv(_LOG2E), base, step, keys, n, col, Val(shp), Val(R), Val(DIM), T)
+        # qN held q·scale·log2e, so dK = scale·Σ dS·q is the accumulator over log2e; with `SCALE_IN_SCORES` it held q, so × scale.
+        _mma_store_rows!(be, dk, dK, SCALE_IN_SCORES ? scale : inv(_LOG2E), base, step, keys, n, col, Val(shp), Val(R), Val(DIM), T)
         _mma_store_rows!(be, dv, dV, 1f0, base, step, keys, n, col, Val(shp), Val(R), Val(DIM), T)
     end
 end
@@ -249,7 +274,7 @@ end
 
 # One key tile for the R query fragments of this simdgroup: `S = Q·Kᵀ` and `dP = dO·Vᵀ` in blocks of `FN` keys,
 # `dQ += dS·K` over chunks of `FK` keys.
-@generated function _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, t, n, col, ::Val{SH}, ::Val{R},
+@generated function _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, sc, t, n, col, ::Val{SH}, ::Val{R},
     ::Val{DIM}, ::Val{BK}, ::Val{HB}) where {SH,R,DIM,BK,HB}
     FM, FN, FK = SH
     NR, NKD, NKK, NDN, NB = FM ÷ 8, DIM ÷ FK, BK ÷ FK, DIM ÷ FN, FK ÷ FN
@@ -281,6 +306,8 @@ end
                     u = NR * (r - 1) + s
                     push!(body, quote
                         s1, s2 = _mma_pair(be, sacc, $s)
+                        s1 *= sc                           # `SCALE_IN_SCORES` (forward.jl); else `sc == 1`
+                        s2 *= sc
                         dp1, dp2 = _mma_pair(be, pacc, $s)
                         c = Int32($(FN * kb)) + col
                         live1 = @inbounds(ms[c+Int32(1)]) == 0f0
@@ -361,7 +388,7 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
     e = tid
     while e < Int32(BQ * DIM)
         d = e % Int32(DIM); r = e ÷ Int32(DIM); j = q0 + r
-        x = j < n ? Float32(unsafe_load(q, base + j * step + d + Int32(1))) * scale * _LOG2E : 0f0
+        x = j < n ? Float32(unsafe_load(q, base + j * step + d + Int32(1))) * _mma_qscale(scale) : 0f0
         @inbounds qs[r+Int32(1), d+Int32(1)] = T(x)
         e += NT
     end
@@ -401,7 +428,7 @@ The `dQ` stage of `:flash_mma`: rows are queries, holding `Q` and `dO` fragments
             e += NT
         end
         @synchronize
-        dQ = _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, t, n, col, Val(shp), Val(R),
+        dQ = _mma_q_tile(be, dQ, Qf, Df, ks, kn, vT, ms, bias, rs, bbs, _mma_score_scale(scale), t, n, col, Val(shp), Val(R),
             Val(DIM), Val(BK), Val(HB))
         t += Int32(BK)
     end

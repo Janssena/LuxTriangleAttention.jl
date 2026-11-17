@@ -30,7 +30,8 @@ second products' operand type, `cfg.ops`; `Float32` when the point has no `ops`)
 function mma_argtypes(stage::Symbol, ::Type{T}, dim::Integer, cfg, hb::Bool, hm::Bool,
     backend::KernelBackend) where {T}
     A(x) = AbstractArray{x}
-    bufs = stage === :fwd ? (A(T), A(Float32), A(T), A(T), A(T), A(T), A(Bool)) :
+    # `:fwd`: o, lse, e (the output residual), q, k, v, bias, mask
+    bufs = stage === :fwd ? (A(T), A(Float32), A(T), A(T), A(T), A(T), A(T), A(Bool)) :
            stage === :dkv ? (A(T), A(T), A(Float32), A(T), A(T), A(T), A(T), A(Bool), A(T), A(Float32), A(Float32)) :
            stage === :dq ? (A(T), A(T), A(T), A(T), A(T), A(Bool), A(T), A(Float32), A(Float32)) :
            throw(ArgumentError("no `:$FLASH_MMA_NAME` stage `:$stage`; stages are $(FLASH_MMA_STAGES)"))
@@ -105,7 +106,7 @@ Short hash of `forward.jl` and `backward.jl`, in every `:flash_mma` binary's nam
 edited kernel is rebuilt rather than served from a stale binary (see [`kernel_source_tag`](@ref)).
 """
 flash_mma_source_tag() = FLASH_MMA_SOURCE_TAG
-const FLASH_MMA_SOURCE_TAG = let h = UInt64(0)
+const FLASH_MMA_SOURCE_TAG = let h = hash(OUTPUT_RESID, hash(SCALE_IN_SCORES, hash(DET_DBIAS, UInt64(0))))      # the mode is compiled in, so it is part of the tag
     for f in ("forward.jl", "backward.jl")
         h = hash(read(joinpath(@__DIR__, f), String), h)
     end

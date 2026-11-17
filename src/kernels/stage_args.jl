@@ -13,7 +13,7 @@
     stage_args(kernel, Val(stage), a, s) -> Tuple
 
 The arguments of one built-in stage's binary, in slot order. `a` holds the buffers by role — `o`,
-`lse`, `q`, `k`, `v`, `bias` (keys fastest), `bias_t` (queries fastest), `mask`, `dO`, `delta`, `dq`,
+`lse`, `e` (the output residual, a 1-element placeholder unless `output_residual`), `q`, `k`, `v`, `bias` (keys fastest), `bias_t` (queries fastest), `mask`, `dO`, `delta`, `dq`,
 `dk`, `dv`, `dbias`, `dbias_t` — of which a stage reads only its own; an output may be an `OutArray`
 (allocated by the launch) or a preallocated array. `s` is `(scale, n, nouter, nh, mheads)`
 (`_scalars` for the op's own layout).
@@ -31,7 +31,7 @@ stage_args(::FlashScalar, ::Val{:dk}, a, s) = (a.dk, a.q, a.k, a.v, a.bias, a.ma
 stage_args(::FlashScalar, ::Val{:dv}, a, s) = (a.dv, a.q, a.k, a.bias, a.mask, a.dO, a.lse, s...)
 
 # `:flash_mma` (`FlashMMA`): the bias as given everywhere; `:dkv` writes `dbias` untransposed.
-stage_args(::FlashMMA, ::Val{:fwd}, a, s) = (a.o, a.lse, a.q, a.k, a.v, a.bias, a.mask, s...)
+stage_args(::FlashMMA, ::Val{:fwd}, a, s) = (a.o, a.lse, a.e, a.q, a.k, a.v, a.bias, a.mask, s...)
 stage_args(::FlashMMA, ::Val{:dkv}, a, s) =
     (a.dk, a.dv, a.dbias, a.q, a.k, a.v, a.bias, a.mask, a.dO, a.lse, a.delta, s...)
 stage_args(::FlashMMA, ::Val{:dq}, a, s) = (a.dq, a.q, a.k, a.v, a.bias, a.mask, a.dO, a.lse, a.delta, s...)
@@ -46,5 +46,5 @@ stage_outputs(::FlashScalar, stage::Symbol) =
     stage === :fwd ? (:o, :lse) : stage === :dq ? (:dq, :dbias_t) : stage === :dk ? (:dk,) :
     stage === :dv ? (:dv,) : throw(ArgumentError("no `:default` stage `:$stage`"))
 stage_outputs(::FlashMMA, stage::Symbol) =
-    stage === :fwd ? (:o, :lse) : stage === :dkv ? (:dk, :dv, :dbias) : stage === :dq ? (:dq,) :
+    stage === :fwd ? (:o, :lse, :e) : stage === :dkv ? (:dk, :dv, :dbias) : stage === :dq ? (:dq,) :
     throw(ArgumentError("no `:flash_mma` stage `:$stage`"))

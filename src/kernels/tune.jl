@@ -89,7 +89,9 @@ const Calibration = Dict{Symbol,Dict{NamedTuple,Float64}}
 # What a role's output is compared with in the verification problem's reference: `dbias_t` is the
 # bias gradient transposed.
 _reference(role::Symbol, ref) = role === :dbias_t ? ref.dbias : getfield(ref, role)
-_as_reference(role::Symbol, x) = role === :dbias_t ? permutedims(x, (2, 1, 3)) : x
+# `:flash_mma`'s deterministic `dbias` is one partial per outer slice, `[key, q, i, bh]` (`DET_DBIAS`): summed over `i`.
+_as_reference(role::Symbol, x) = role === :dbias_t ? permutedims(x, (2, 1, 3)) :
+                                 role === :dbias && DET_DBIAS ? dropdims(sum(x; dims=3); dims=3) : x
 
 """
     verify_stage(kernel, stage, b, V) -> Bool
@@ -107,8 +109,13 @@ function _verify_on(k::BuiltinKernel, stage::Symbol, b::KernelDispatch.KernelBin
     T = eltype(V.q)
     P = packed_problem(V.q, V.k, V.v, V.bias, V.mask, V.dO, V.o, V.lse, V.delta)
     outs = run_stage!(k, stage, b, P; V.n, V.nouter, heads=V.bh, V.mheads)
-    err = maximum(zip(stage_outputs(k, stage), outs)) do (role, x)
-        verification_error(_as_reference(role, Array(x)), _reference(role, V.ref))
+    roles = stage_outputs(k, stage)
+    host = Dict(role => Array(x) for (role, x) in zip(roles, outs))
+    err = maximum(roles) do role
+        # The output residual: the stored `e` is no output of its own, `o + e` is, and must be at least as close to the reference as
+        # `o` (a placeholder, when the build has no residual, is not checked).
+        role === :e && return _mma_resid(T) ? verification_error(Float64.(host[:o]) .+ Float64.(host[:e]), V.ref.o) : 0.0
+        verification_error(_as_reference(role, host[role]), _reference(role, V.ref))
     end
     return err <= verification_tolerance(T)
 end
@@ -182,6 +189,10 @@ end
 
 function _probe(::Type{T}, dim, n, heads) where {T}
     nouter, heads = _probe_geometry(dim, n, n, heads)
+    # `DET_DBIAS`: the probe's `dbias` holds `n²·nouter·heads` partials, indexed with Int32.
+    while DET_DBIAS && nouter > 1 && Int128(n)^2 * nouter * heads >= 1 << 30
+        nouter ÷= 2
+    end
     rng = Random.Xoshiro(1)
     r(dims...) = T.(randn(rng, Float32, dims...))
     q, k, v, dO = (r(dim, n, nouter, heads) for _ in 1:4)

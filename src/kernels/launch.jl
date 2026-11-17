@@ -59,10 +59,13 @@ function packed_problem(q, k, v, bias, mask, dO, o, lse, delta)
     be = KernelDispatch.device_backend()
     d(x) = to_device(be, x)
     n, nb = size(q, 2), size(bias, 3)
-    return (; q=d(q), k=d(k), v=d(v), dO=d(dO), bias=d(bias), bias_t=d(permutedims(bias, (2, 1, 3))),
+    nouter = size(q, 3)
+    e = _mma_resid(eltype(o)) ? zero(o) : zeros(eltype(o), 1)         # the output residual (`OUTPUT_RESID`) or a placeholder
+    return (; q=d(q), k=d(k), v=d(v), dO=d(dO), e=d(e), bias=d(bias), bias_t=d(permutedims(bias, (2, 1, 3))),
         mask=d(mask), o=d(o), lse=d(lse), delta=d(delta),
         dq=d(zero(q)), dk=d(zero(k)), dv=d(zero(v)),
-        dbias=d(zeros(Float32, n, n, nb)), dbias_t=d(zeros(Float32, n, n, nb)))
+        dbias=d(DET_DBIAS ? zeros(Float32, n, n, nouter, nb) : zeros(Float32, n, n, nb)),     # `DET_DBIAS`: a partial per outer slice
+        dbias_t=d(zeros(Float32, n, n, nb)))
 end
 
 """

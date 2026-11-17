@@ -207,9 +207,25 @@ end
 # Forward
 # ---------------------------------------------------------------------------------------------
 
+# Where `scale·log2e` is applied to `q`. Today it multiplies `q` while it is staged, and the product is rounded to the storage type: a
+# SECOND rounding of `q` (the first put it in that type), of relative size 2⁻¹¹ (Float16) or 2⁻⁸ (BFloat16), in every score.
+# With `scale_in_scores` (package preference, default `false`; compile time) `q` is staged as it is, exactly, and the scores are
+# multiplied by `scale·log2e` in Float32 after the matrix product. `_mma_qscale` multiplies the staged `q`, `_mma_score_scale`
+# the scores; each is 1 where the other applies the factor. Part of the kernel source tag.
+const SCALE_IN_SCORES = Preferences.@load_preference("scale_in_scores", false)::Bool
+@inline _mma_qscale(scale) = SCALE_IN_SCORES ? 1f0 : scale * _LOG2E
+@inline _mma_score_scale(scale) = SCALE_IN_SCORES ? scale * _LOG2E : 1f0
+
+# The output residual. `o` is stored rounded to the storage type, and the backward's `δ = Σ dO·o` then carries that rounding. With
+# `output_residual` (package preference, default `false`; compile time) and a 16-bit storage type the forward also stores
+# `e = T(O32 − o)`, the part of the Float32 accumulator the rounding dropped, and the backward uses `Σ dO·(o + e)`. A third buffer of
+# `o`'s size and one more store per output element. Float32 storage has no residual: its output IS the accumulator.
+const OUTPUT_RESID = Preferences.@load_preference("output_residual", false)::Bool
+_mma_resid(::Type{T}) where {T} = OUTPUT_RESID && T !== Float32
+
 # One key tile for the R query fragments of this simdgroup. `st[u] = (m, l)` of this lane's row slot `u`. The bias comes
 # from device memory (`bias`, rows `bbs`) or, with `SB`, from the staged tile (`bs`, local rows `brs`).
-@generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, bs, brs, t, n, col, ::Val{SH}, ::Val{R},
+@generated function _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, bs, brs, sc, t, n, col, ::Val{SH}, ::Val{R},
     ::Val{DIM}, ::Val{BK}, ::Val{HB}, ::Val{SB}) where {SH,R,DIM,BK,HB,SB}
     FM, FN, FK = SH
     NR, NKD, NKB, NKK, NDN, NB = FM ÷ 8, DIM ÷ FK, BK ÷ FN, BK ÷ FK, DIM ÷ FN, FK ÷ FN
@@ -236,6 +252,8 @@ end
                 a, b = s1(u, kb), s2(u, kb)
                 push!(body, quote
                     $a, $b = _mma_pair(be, $(acc(kb)), $s)
+                    $a *= sc                       # `SCALE_IN_SCORES`: scale·log2e applied here, else `sc == 1`
+                    $b *= sc
                     c = Int32($(FN * kb)) + col
                     b1, b2 = $(SB ? :(_mma_bias2s(bs, brs[$u], c, Val(HB))) :
                                     :(_mma_bias2(bias, bbs[$u], t + c, n, Val(HB))))
@@ -286,8 +304,9 @@ end
 @inline _mma_bias_rows(bh, n, j0, ::Val{U}) where {U} =
     ntuple(u -> (bh * n + min(j0 + Int32(8 * (u - 1)), n - Int32(1))) * n, Val(U))
 
-@generated function _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, lrow, col, ::Val{SH}, ::Val{R},
+@generated function _mma_fwd_store!(be, o, lse, eres, O, st, j0, n, base, step, lrow, col, ::Val{SH}, ::Val{R},
     ::Val{DIM}, ::Type{T}) where {SH,R,DIM,T}
+    res = _mma_resid(T)
     FM, FN, FK = SH
     NR = FM ÷ 8
     body = Expr[]
@@ -296,8 +315,14 @@ end
         stores = map(1:DIM÷FN) do d
             quote
                 x, y = _mma_pair(be, O[$rb][$d], $s)
-                unsafe_store!(o, T(x * w), ob + Int32($(FN * (d - 1))))
-                unsafe_store!(o, T(y * w), ob + Int32($(FN * (d - 1) + 1)))
+                x32, y32 = x * w, y * w
+                xo, yo = T(x32), T(y32)
+                unsafe_store!(o, xo, ob + Int32($(FN * (d - 1))))
+                unsafe_store!(o, yo, ob + Int32($(FN * (d - 1) + 1)))
+                $(res ? quote
+                    unsafe_store!(eres, T(x32 - Float32(xo)), ob + Int32($(FN * (d - 1))))
+                    unsafe_store!(eres, T(y32 - Float32(yo)), ob + Int32($(FN * (d - 1) + 1)))
+                end : nothing)
             end
         end
         push!(body, quote
@@ -319,7 +344,7 @@ end
 const _MMA_NEG = -floatmax(Float32)
 
 """
-    flash_mma_fwd!(o, lse, q, k, v, bias, mask, scale, n, nouter, nh, mheads,
+    flash_mma_fwd!(o, lse, eres, q, k, v, bias, mask, scale, n, nouter, nh, mheads,
         Val(BE), Val(T), Val(DIM), Val(NSG), Val(R), Val(BK), Val(HB), Val(HM), Val(PE))
 
 Forward of `:flash_mma`. Same buffers, layout and results as [`flash_fwd!`](@ref) except that the
@@ -332,7 +357,7 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
 `Q·Kᵀ` multiplies storage-type fragments; `P·V` multiplies `PE` operands; every accumulator is
 `Float32` (see "Precision" in this file's header).
 """
-@kernel unsafe_indices = true function flash_mma_fwd!(o, lse, q, k, v, bias, mask,
+@kernel unsafe_indices = true function flash_mma_fwd!(o, lse, eres, q, k, v, bias, mask,
     scale, n, nouter, nh, mheads, ::Val{BE}, ::Val{T}, ::Val{DIM}, ::Val{NSG},
     ::Val{R}, ::Val{BK}, ::Val{HB}, ::Val{HM}, ::Val{PE}) where {BE,T,DIM,NSG,R,BK,HB,HM,PE}
     be = BE()
@@ -372,7 +397,7 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
     while e < Int32(BQ * DIM)
         d = e % Int32(DIM); r = e ÷ Int32(DIM); j = q0 + r
         x = j < n ? Float32(unsafe_load(q, base + j * step + d + Int32(1))) : 0f0
-        @inbounds qs[r+Int32(1), d+Int32(1)] = T(x * scale * _LOG2E)
+        @inbounds qs[r+Int32(1), d+Int32(1)] = T(x * _mma_qscale(scale))
         e += NT
     end
     @synchronize
@@ -411,10 +436,10 @@ and holds their `Q` operands for the whole call. Per key tile of `BK` keys the g
             e += NT
         end
         @synchronize
-        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, bs, brs, t, n, col, Val(shp), Val(R), Val(DIM), Val(BK),
+        O, st = _mma_fwd_tile(be, O, st, Qf, ks, vs, ms, bias, bbs, bs, brs, _mma_score_scale(scale), t, n, col, Val(shp), Val(R), Val(DIM), Val(BK),
             Val(HB), Val(SB))
         t += Int32(BK)
     end
-    _mma_fwd_store!(be, o, lse, O, st, j0, n, base, step, (bi * nouter + i) * nh + hi, col,
+    _mma_fwd_store!(be, o, lse, eres, O, st, j0, n, base, step, (bi * nouter + i) * nh + hi, col,
         Val(shp), Val(R), Val(DIM), T)
 end

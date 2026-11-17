@@ -72,7 +72,8 @@ KernelDispatch.@default_kernel SDPA FlashScalar() FlashMMA()
 # variant registered before has none (it loads unchecked and warns on its first launch), so those are
 # dropped and re-tuned rather than kept.
 # k6: a variant's binaries also record the tuned point as their `params` (`build_stage`).
-const _KEY_FORMAT = "k6"
+# k7: `:flash_mma`'s forward takes the output-residual buffer `e` after `lse`.
+const _KEY_FORMAT = "k7"
 KernelDispatch.source_tag(::FlashScalar) = kernel_source_tag() * "-" * _KEY_FORMAT
 KernelDispatch.source_tag(::FlashMMA) = flash_mma_source_tag() * "-" * _KEY_FORMAT
 
@@ -140,7 +141,9 @@ end
 # The scalars every built-in stage takes after its buffers: scale, n, nouter, nh, mheads (see `stage_args`).
 _scalars(d) = (Float32(inv(sqrt(d.hd))), Int32(d.Nq), Int32(d.Nj), Int32(d.H), Int32(d.H))
 # `Σ_d o·dO`, laid out like `lse`, in Float32 whatever the storage type: the kernels read it as such.
-_delta(o, dO) = permutedims(sum(_f32(o) .* _f32(dO); dims=1), (1, 3, 2, 4, 5))
+# With the forward's output residual `e` (`output_residual`, `:flash_mma`) δ uses `o + e`, the Float32 output before its rounding.
+_delta(o, dO, e=nothing) =
+    permutedims(sum((e === nothing ? _f32(o) : _f32(o) .+ _f32(e)) .* _f32(dO); dims=1), (1, 3, 2, 4, 5))
 # The pair bias with its two pair axes swapped (queries fastest), and back.
 _pair_t(x, d) = d.hasbias ? permutedims(reshape(x, d.Nq, d.Nq, :), (2, 1, 3)) : x
 # A plain sequence's results back at its own rank.
@@ -218,18 +221,22 @@ function KernelDispatch.forward(op::SDPA, k::FlashMMA, q0, k0, v0, mask, bias)
     Tc = mma_compute_type(mma_backend(), T)
     (Tc === nothing || !mma_dim_runs(size(q0, 1))) && return _mma_fallback_forward(op, q0, k0, v0, mask, bias)
     if Tc !== T
-        o, lse = _mma_forward(op, k, _narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask, _narrow(Tc, bias))
-        return _widen(T, o), lse
+        o, lse, rest... = _mma_forward(op, k, _narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask, _narrow(Tc, bias))
+        return (_widen(T, o), lse, rest...)       # `rest`: the residual, kept at the type the kernel computed in
     end
     return _mma_forward(op, k, q0, k0, v0, mask, bias)
 end
 
+# `(o, lse)`, or `(o, lse, e)` with the output residual (`output_residual`, 16-bit storage): the backward takes either.
 function _mma_forward(op, k, q0, k0, v0, mask, bias)
     q, kk, v, m, b, d = _sdpa_prep(q0, k0, v0, mask, bias, true)
-    a = (; o=OutArray(d.T, _full(d)), lse=OutArray(Float32, _res(d)), q, k=kk, v, bias=b, mask=m)
-    o, lse = call_binary(op, k, :fwd, stage_args(k, Val(:fwd), a, _scalars(d))...;
+    res = _mma_resid(d.T)
+    a = (; o=OutArray(d.T, _full(d)), lse=OutArray(Float32, _res(d)), e=OutArray(d.T, res ? _full(d) : (1,)),
+        q, k=kk, v, bias=b, mask=m)
+    o, lse, e = call_binary(op, k, :fwd, stage_args(k, Val(:fwd), a, _scalars(d))...;
         key=_key(d), extent=_extent(d))
-    return _finish(o, lse, q0)
+    o, lse = _finish(o, lse, q0)
+    return res ? (o, lse, reshape(e, size(o))) : (o, lse)
 end
 
 function KernelDispatch.backward(op::SDPA, k::FlashScalar, (q0, k0, v0, mask, bias), (o, lse), (dO, _))
@@ -246,28 +253,47 @@ function KernelDispatch.backward(op::SDPA, k::FlashScalar, (q0, k0, v0, mask, bi
     return (_as(dq, q0), _as(dk, k0), _as(dv, v0), nothing, db)
 end
 
-function KernelDispatch.backward(op::SDPA, k::FlashMMA, (q0, k0, v0, mask, bias), (o, lse), (dO, _))
+function KernelDispatch.backward(op::SDPA, k::FlashMMA, (q0, k0, v0, mask, bias), res, (dO, _))
+    o, lse = res[1], res[2]
+    e = length(res) > 2 ? res[3] : nothing          # the forward's output residual, when it wrote one
     T = eltype(q0)
     Tc = mma_compute_type(mma_backend(), T)
     (isnothing(Tc) || !mma_dim_runs(size(q0, 1))) &&
         return _mma_fallback_backward(op, (q0, k0, v0, mask, bias), (o, lse), (dO, nothing))
     if Tc !== T
         dq, dk, dv, _, db = _mma_backward(op, k, (_narrow(Tc, q0), _narrow(Tc, k0), _narrow(Tc, v0), mask,
-            _narrow(Tc, bias)), (_narrow(Tc, o), lse), (_narrow(Tc, dO), nothing))
+            _narrow(Tc, bias)), (_narrow(Tc, o), lse, e), (_narrow(Tc, dO), nothing))
         return (_widen(T, dq), _widen(T, dk), _widen(T, dv), nothing, db === nothing ? nothing : _widen(eltype(bias), db))
     end
-    return _mma_backward(op, k, (q0, k0, v0, mask, bias), (o, lse), (dO, nothing))
+    return _mma_backward(op, k, (q0, k0, v0, mask, bias), (o, lse, e), (dO, nothing))
 end
 
-function _mma_backward(op, k, (q0, k0, v0, mask, bias), (o, lse), (dO, _))
+# `:flash_mma`'s `dbias` buffer: the bias's own shape, accumulated with atomics, or (`DET_DBIAS`) one partial per outer slice,
+# `[key, q, i, bh]`, summed by the op afterwards. The partials are Float32 `Nq²·Nj·H·B`, cubic in `Nq` for a triangle, and
+# the kernel indexes them with Int32: a call that needs more than `DBIAS_PARTIAL_LIMIT` bytes (or 2³¹ - 1 elements) is refused
+# rather than allowed to run out of memory or wrap around.
+const DBIAS_PARTIAL_LIMIT = 8 << 30
+function _mma_dbias_shape(d)
+    DET_DBIAS || return (d.Nq, d.Nq, d.H, d.B)
+    len = Int128(d.Nq)^2 * d.Nj * d.H * d.B
+    (len < typemax(Int32) && 4len <= DBIAS_PARTIAL_LIMIT) || throw(ArgumentError(
+        "deterministic `dbias` needs $(round(4len / 2^30; digits=1)) GiB of partials for Nq=$(d.Nq), outer extent $(d.Nj), " *
+        "$(d.H * d.B) head slices (limit $(DBIAS_PARTIAL_LIMIT >> 30) GiB, indices are 32-bit). Split the call (smaller batch or " *
+        "chunked outer axis), or turn it off: `set_preferences!(LuxTriangleAttention, \"deterministic_dbias\" => false)`."))
+    return (d.Nq, d.Nq, d.Nj, d.H * d.B)
+end
+
+function _mma_backward(op, k, (q0, k0, v0, mask, bias), (o, lse, e), (dO, _))
     q, kk, v, m, b, d = _sdpa_prep(q0, k0, v0, mask, bias, true)
     o, dO, lse =reshape(o, _full(d)), _store(d.T, reshape(dO, _full(d))), reshape(lse, _res(d))
+    e = e === nothing ? nothing : reshape(e, _full(d))
     s, key, extent = _scalars(d), _key(d), _extent(d)
-    a = (; q, k=kk, v, bias=b, mask=m, dO, lse, delta=_delta(o, dO),
+    a = (; q, k=kk, v, bias=b, mask=m, dO, lse, delta=_delta(o, dO, e),
         dq=OutArray(d.T, _full(d)), dk=OutArray(d.T, _full(d)), dv=OutArray(d.T, _full(d)),
-        dbias=OutArray(Float32, d.hasbias ? (d.Nq, d.Nq, d.H, d.B) : (1,); zero=true))
+        dbias=OutArray(Float32, d.hasbias ? _mma_dbias_shape(d) : (1,); zero=true))
     dk, dv, db = call_binary(op, k, :dkv, stage_args(k, Val(:dkv), a, s)...; key, extent)
     dq, = call_binary(op, k, :dq, stage_args(k, Val(:dq), a, s)...; key, extent)
+    d.hasbias && DET_DBIAS && (db = reshape(sum(db; dims=3), d.Nq, d.Nq, d.H, d.B))   # over the outer slices, in a fixed order
     return (_as(dq, q0), _as(dk, k0), _as(dv, v0), nothing, d.hasbias ? _as(db, bias) : nothing)
 end
 
